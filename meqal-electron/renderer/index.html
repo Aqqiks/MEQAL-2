@@ -1,0 +1,506 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com;">
+<title>MEQAL Valve Control</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=DM+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg-deep:    #07090d;
+    --bg-panel:   #0e1318;
+    --bg-card:    #121920;
+    --bg-hover:   #1a2330;
+    --border:     #1e2d3d;
+    --border-hi:  #2a3f55;
+    --green:      #22c55e;
+    --green-dim:  #16a34a;
+    --green-glow: rgba(34,197,94,0.15);
+    --red:        #ef4444;
+    --red-dim:    #b91c1c;
+    --amber:      #f59e0b;
+    --blue:       #3b82f6;
+    --text-1:     #e2eaf4;
+    --text-2:     #7a8fa8;
+    --text-3:     #3d5268;
+    --mono:       'JetBrains Mono', monospace;
+    --sans:       'DM Sans', sans-serif;
+    --radius:     10px;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    font-family: var(--sans);
+    background: var(--bg-deep);
+    color: var(--text-1);
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    user-select: none;
+  }
+
+  /* ── TITLEBAR ── */
+  .titlebar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0 20px;
+    height: 48px;
+    background: var(--bg-panel);
+    border-bottom: 1px solid var(--border);
+    -webkit-app-region: drag;
+    flex-shrink: 0;
+  }
+
+  .titlebar-left {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+
+  .logo-mark {
+    width: 28px; height: 28px;
+    background: linear-gradient(135deg, var(--green) 0%, #16a34a 100%);
+    border-radius: 6px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-family: var(--mono);
+    font-size: 11px;
+    font-weight: 600;
+    color: #000;
+    letter-spacing: -0.5px;
+  }
+
+  .app-title {
+    font-size: 13px;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    color: var(--text-1);
+  }
+
+  .titlebar-right {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    -webkit-app-region: no-drag;
+  }
+
+  .live-badge {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--text-2);
+  }
+
+  .pulse-dot {
+    width: 7px; height: 7px;
+    border-radius: 50%;
+    background: var(--green);
+    box-shadow: 0 0 0 0 var(--green-glow);
+    animation: pulse-ring 2s infinite;
+  }
+
+  .pulse-dot.stopped { background: var(--text-3); animation: none; box-shadow: none; }
+
+  @keyframes pulse-ring {
+    0%   { box-shadow: 0 0 0 0 rgba(34,197,94,0.5); }
+    70%  { box-shadow: 0 0 0 7px rgba(34,197,94,0); }
+    100% { box-shadow: 0 0 0 0 rgba(34,197,94,0); }
+  }
+
+  /* ── TOOLBAR ── */
+  .toolbar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 10px 16px;
+    background: var(--bg-panel);
+    border-bottom: 1px solid var(--border);
+    flex-shrink: 0;
+  }
+
+  .btn {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 7px 14px;
+    border-radius: var(--radius);
+    border: 1px solid var(--border);
+    background: var(--bg-card);
+    color: var(--text-1);
+    font-family: var(--sans);
+    font-size: 13px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: background 0.15s, border-color 0.15s;
+    -webkit-app-region: no-drag;
+    white-space: nowrap;
+  }
+
+  .btn:hover { background: var(--bg-hover); border-color: var(--border-hi); }
+
+  .btn-primary {
+    background: var(--green-dim);
+    border-color: var(--green);
+    color: #fff;
+  }
+  .btn-primary:hover { background: var(--green); }
+
+  .btn-danger {
+    background: var(--red-dim);
+    border-color: var(--red);
+    color: #fff;
+    font-weight: 600;
+    letter-spacing: 0.03em;
+  }
+  .btn-danger:hover { background: var(--red); }
+
+  .btn-running {
+    background: rgba(245,158,11,0.15);
+    border-color: var(--amber);
+    color: var(--amber);
+  }
+
+  .toolbar-sep {
+    width: 1px;
+    height: 28px;
+    background: var(--border);
+    margin: 0 4px;
+  }
+
+  .row-select {
+    padding: 7px 10px;
+    border-radius: var(--radius);
+    border: 1px solid var(--border);
+    background: var(--bg-card);
+    color: var(--text-1);
+    font-family: var(--sans);
+    font-size: 13px;
+    cursor: pointer;
+    -webkit-app-region: no-drag;
+  }
+
+  /* ── MAIN LAYOUT ── */
+  .main {
+    display: grid;
+    grid-template-columns: 1fr 320px;
+    gap: 0;
+    flex: 1;
+    overflow: hidden;
+  }
+
+  /* ── LEFT PANEL ── */
+  .left-panel {
+    display: flex;
+    flex-direction: column;
+    padding: 14px;
+    gap: 14px;
+    overflow: hidden;
+  }
+
+  .panel {
+    background: var(--bg-panel);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 16px;
+  }
+
+  .panel-label {
+    font-family: var(--mono);
+    font-size: 10px;
+    letter-spacing: 0.12em;
+    color: var(--text-3);
+    text-transform: uppercase;
+    margin-bottom: 12px;
+  }
+
+  .chart-wrap {
+    flex: 1;
+    min-height: 0;
+  }
+
+  .chart-wrap canvas {
+    width: 100% !important;
+    height: 100% !important;
+  }
+
+  /* ── RIGHT SIDEBAR ── */
+  .sidebar {
+    border-left: 1px solid var(--border);
+    background: var(--bg-panel);
+    display: flex;
+    flex-direction: column;
+    overflow-y: auto;
+    padding: 14px;
+    gap: 14px;
+  }
+
+  /* ── TOTAL FLOW ── */
+  .total-card {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 20px;
+    text-align: center;
+  }
+
+  .total-value {
+    font-family: var(--mono);
+    font-size: 44px;
+    font-weight: 600;
+    color: var(--green);
+    line-height: 1;
+    transition: color 0.3s;
+  }
+
+  .total-unit {
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--text-3);
+    margin-top: 4px;
+  }
+
+  .stats-row {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 8px;
+    margin-top: 12px;
+  }
+
+  .stat-box {
+    background: var(--bg-panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px;
+    text-align: center;
+  }
+
+  .stat-value {
+    font-family: var(--mono);
+    font-size: 18px;
+    font-weight: 600;
+    color: var(--text-1);
+  }
+
+  .stat-label {
+    font-size: 10px;
+    color: var(--text-3);
+    margin-top: 2px;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+  }
+
+  /* ── VALVE GRID ── */
+  .valve-grid-card {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 14px;
+    flex: 1;
+  }
+
+  .grid-container {
+    display: grid;
+    grid-template-columns: repeat(7, 1fr);
+    grid-template-rows: repeat(7, 1fr);
+    gap: 4px;
+    aspect-ratio: 1 / 1;
+    width: 100%;
+  }
+
+  .box {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-family: var(--mono);
+    font-size: 9px;
+    font-weight: 600;
+    color: rgba(255,255,255,0.4);
+    background: #1a2433;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    cursor: pointer;
+    transition: background 0.15s, box-shadow 0.15s, color 0.15s;
+    aspect-ratio: 1;
+  }
+
+  .box:hover {
+    background: var(--bg-hover);
+    border-color: var(--border-hi);
+    color: var(--text-1);
+  }
+
+  .box.online {
+    background: var(--green-dim);
+    border-color: var(--green);
+    color: #fff;
+    box-shadow: 0 0 8px rgba(34,197,94,0.4);
+  }
+
+  .box.offline {
+    background: #2a1010;
+    border-color: var(--red-dim);
+    color: rgba(239,68,68,0.5);
+  }
+
+  /* ── MINI FLOW CHART ── */
+  .mini-chart-wrap {
+    height: 80px;
+    margin-top: 10px;
+  }
+
+  /* ── STATUS BAR ── */
+  .statusbar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 5px 16px;
+    background: var(--bg-panel);
+    border-top: 1px solid var(--border);
+    font-family: var(--mono);
+    font-size: 10px;
+    color: var(--text-3);
+    flex-shrink: 0;
+  }
+
+  .statusbar-item { display: flex; align-items: center; gap: 6px; }
+
+  /* ── TOAST ── */
+  #toast {
+    position: fixed;
+    bottom: 36px;
+    right: 20px;
+    background: var(--bg-hover);
+    border: 1px solid var(--border-hi);
+    border-radius: var(--radius);
+    padding: 10px 16px;
+    font-size: 13px;
+    color: var(--text-1);
+    opacity: 0;
+    transform: translateY(8px);
+    transition: opacity 0.2s, transform 0.2s;
+    pointer-events: none;
+    z-index: 999;
+  }
+  #toast.show { opacity: 1; transform: translateY(0); }
+
+  /* ── EMERGENCY FLASH ── */
+  @keyframes emergency-flash {
+    0%, 100% { background: var(--bg-deep); }
+    50%       { background: rgba(239,68,68,0.06); }
+  }
+  body.emergency { animation: emergency-flash 0.4s ease 3; }
+</style>
+</head>
+<body>
+
+<!-- TITLEBAR -->
+<div class="titlebar">
+  <div class="titlebar-left">
+    <div class="logo-mark">MQ</div>
+    <span class="app-title">MEQAL Valve Control System</span>
+  </div>
+  <div class="titlebar-right">
+    <div class="live-badge">
+      <div class="pulse-dot" id="pulseDot"></div>
+      <span id="sysStatus">IDLE</span>
+    </div>
+  </div>
+</div>
+
+<!-- TOOLBAR -->
+<div class="toolbar">
+  <button class="btn btn-primary" id="startBtn">▶ Start</button>
+  <button class="btn" id="stopBtn">■ Stop</button>
+  <div class="toolbar-sep"></div>
+  <select class="row-select" id="areaSelect">
+    <option value="Row 1">Row 1  (valves 0–6)</option>
+    <option value="Row 2">Row 2  (valves 7–13)</option>
+    <option value="Row 3">Row 3  (valves 14–20)</option>
+    <option value="Row 4">Row 4  (valves 21–27)</option>
+    <option value="Row 5">Row 5  (valves 28–34)</option>
+    <option value="Row 6" selected>Row 6  (valves 35–41)</option>
+    <option value="Row 7">Row 7  (valves 42–48)</option>
+  </select>
+  <div class="toolbar-sep"></div>
+  <button class="btn" id="resetValvesBtn">⊘ Reset Valves</button>
+  <button class="btn" id="resetTotalBtn">↺ Reset Total</button>
+  <button class="btn" id="csvBtn">⬇ Export CSV</button>
+  <div class="toolbar-sep"></div>
+  <button class="btn btn-danger" id="emergencyBtn">⚠ EMERGENCY STOP</button>
+</div>
+
+<!-- MAIN -->
+<div class="main">
+
+  <!-- LEFT: FLOW CHART -->
+  <div class="left-panel">
+    <div class="panel panel-label">Flow Rate — Live</div>
+    <div class="panel chart-wrap">
+      <canvas id="chartCanvas"></canvas>
+    </div>
+  </div>
+
+  <!-- RIGHT: SIDEBAR -->
+  <div class="sidebar">
+
+    <!-- TOTAL -->
+    <div class="total-card">
+      <div class="panel-label">Total Flow</div>
+      <div class="total-value" id="totalText">0.00</div>
+      <div class="total-unit">Litres accumulated</div>
+      <div class="stats-row">
+        <div class="stat-box">
+          <div class="stat-value" id="activeCount">0</div>
+          <div class="stat-label">Active Valves</div>
+        </div>
+        <div class="stat-box">
+          <div class="stat-value" id="flowRate">0.00</div>
+          <div class="stat-label">L/s Now</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- VALVE GRID -->
+    <div class="valve-grid-card">
+      <div class="panel-label">Valve Map — 7×7</div>
+      <div class="grid-container" id="valveGrid"></div>
+    </div>
+
+    <!-- MINI CHART -->
+    <div class="panel">
+      <div class="panel-label">Flow History</div>
+      <div class="mini-chart-wrap">
+        <canvas id="totalChartCanvas"></canvas>
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<!-- STATUS BAR -->
+<div class="statusbar">
+  <div class="statusbar-item">
+    <span id="sbStatus">System idle</span>
+  </div>
+  <div class="statusbar-item">
+    <span id="sbTime">--:--:--</span>
+  </div>
+  <div class="statusbar-item">
+    MEQAL v1.0  ·  Electron
+  </div>
+</div>
+
+<!-- TOAST -->
+<div id="toast"></div>
+
+<script src="renderer.js"></script>
+</body>
+</html>
