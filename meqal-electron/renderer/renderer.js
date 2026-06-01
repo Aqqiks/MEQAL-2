@@ -32,7 +32,7 @@ const sbTime       = document.getElementById("sbTime");
 
 const valveGrid = document.getElementById("valveGrid");
 
-for (let i = 0; i < VALVE_COUNT; i++) {
+for (let i = 1; i <= VALVE_COUNT; i++) {
   const box = document.createElement("div");
   box.className = "box";
   box.id = `valve-${i}`;
@@ -51,6 +51,64 @@ for (let i = 0; i < VALVE_COUNT; i++) {
 
   valveGrid.appendChild(box);
 }
+
+// =====================================================
+// PER-VALVE CUMULATIVE FLOW BAR CHART
+// =====================================================
+
+const valveLabels = Array.from({ length: VALVE_COUNT }, (_, i) => `V${i + 1}`);
+const valveCumulativeFlow = new Array(VALVE_COUNT).fill(0);
+
+const valveChartCtx = document.getElementById("valveChartCanvas").getContext("2d");
+
+const valveChartData = {
+  labels: valveLabels,
+  datasets: [{
+    label: "Cumulative Flow (L)",
+    data: [...valveCumulativeFlow],
+    backgroundColor: "rgba(34,197,94,0.45)",
+    borderColor: "#22c55e",
+    borderWidth: 1,
+  }]
+};
+
+const valveChart = new Chart(valveChartCtx, {
+  type: "bar",
+  data: valveChartData,
+  options: {
+    responsive: true,
+    maintainAspectRatio: false,
+    animation: false,
+    plugins: {
+      legend: { display: false },
+      tooltip: {
+        backgroundColor: "#0e1318",
+        borderColor: "#1e2d3d",
+        borderWidth: 1,
+        titleColor: "#7a8fa8",
+        bodyColor: "#e2eaf4",
+        bodyFont: { family: "JetBrains Mono", size: 12 },
+      }
+    },
+    scales: {
+      x: {
+        ticks: {
+          color: "#3d5268",
+          font: { family: "JetBrains Mono", size: 9 },
+          autoSkip: false,
+          maxRotation: 90,
+          minRotation: 90,
+        },
+        grid: { color: "rgba(30,45,61,0.6)" },
+      },
+      y: {
+        ticks: { color: "#3d5268", font: { family: "JetBrains Mono", size: 9 } },
+        grid: { color: "rgba(30,45,61,0.6)" },
+        beginAtZero: true,
+      }
+    }
+  }
+});
 
 // =====================================================
 // MAIN FLOW CHART
@@ -103,6 +161,7 @@ const mainChart = new Chart(chartCtx, {
     }
   }
 });
+
 
 // =====================================================
 // MINI FLOW HISTORY CHART
@@ -159,7 +218,7 @@ function updateUi(state) {
   // Totals
   totalText.innerText  = total.toFixed(2);
   activeCount.innerText = actCount;
-  flowRateEl.innerText  = (FLOW_RATE_LPS_PER_VALVE * actCount).toFixed(2);
+  flowRateEl.innerText  = flowNow.toFixed(2);
 
   // Running state styling
   isRunning = state.running;
@@ -171,10 +230,20 @@ function updateUi(state) {
 
   // Update valve grid visuals from backend state
   if (state.valve_states) {
-    state.valve_states.forEach((on, i) => {
+    for (let i = 1; i <= VALVE_COUNT; i++) {
       const box = document.getElementById(`valve-${i}`);
-      if (box) box.classList.toggle("online", on);
-    });
+      if (box) box.classList.toggle("online", state.valve_states[i]);
+    }
+  }
+
+  // Per-valve cumulative flow accumulation (0.5 s tick)
+  if (state.valve_states && isRunning) {
+    const tickFlow = FLOW_RATE_LPS_PER_VALVE * 0.5;
+    for (let i = 1; i <= VALVE_COUNT; i++) {
+      if (state.valve_states[i]) valveCumulativeFlow[i - 1] += tickFlow;
+    }
+    valveChartData.datasets[0].data = [...valveCumulativeFlow];
+    valveChart.update("none");
   }
 
   // Append to main chart
@@ -211,6 +280,7 @@ async function syncValves() {
 
 window.api.onStateUpdate((state) => {
   updateUi(state);
+  if (state.auto_stopped) toast("Timer elapsed — system stopped");
 });
 
 // =====================================================
@@ -259,8 +329,11 @@ document.getElementById("resetTotalBtn").addEventListener("click", async () => {
   chartData.datasets[0].data = [];
   miniData.labels = [];
   miniData.datasets[0].data = [];
+  valveCumulativeFlow.fill(0);
+  valveChartData.datasets[0].data = [...valveCumulativeFlow];
   mainChart.update();
   miniChart.update();
+  valveChart.update();
   toast("Total flow reset");
 });
 
@@ -277,22 +350,65 @@ document.getElementById("csvBtn").addEventListener("click", async () => {
 // ROW SELECT — activate a full row of 7 valves
 // =====================================================
 
+document.getElementById("selectAllBtn").addEventListener("click", async () => {
+  activeValves.clear();
+  for (let i = 1; i <= VALVE_COUNT; i++) activeValves.add(i);
+  document.querySelectorAll(".box").forEach(b => {
+    b.classList.add("online");
+    b.classList.remove("offline");
+  });
+  await syncValves();
+  toast("All 49 valves selected");
+});
+
 document.getElementById("areaSelect").onchange = async (e) => {
-  const row = parseInt(e.target.value.replace("Row ", ""));
+  const val = e.target.value;
+  if (!val) return;
 
   activeValves.clear();
-  for (let i = (row - 1) * 7; i < row * 7; i++) {
-    activeValves.add(i);
+
+  if (val.startsWith("row-")) {
+    const row = parseInt(val.slice(4));
+    const start = (row - 1) * 7 + 1;
+    for (let i = start; i < start + 7; i++) activeValves.add(i);
+    toast(`Row ${row} selected (valves ${start}–${start + 6})`);
+  } else if (val.startsWith("col-")) {
+    const col = parseInt(val.slice(4)); // 1-indexed
+    for (let r = 0; r < 7; r++) activeValves.add(col + r * 7);
+    toast(`Col ${col} selected (valves ${col},${col+7},${col+14}…)`);
   }
 
   document.querySelectorAll(".box").forEach((b, i) => {
-    b.classList.toggle("online", activeValves.has(i));
+    b.classList.toggle("online", activeValves.has(i + 1));
     b.classList.remove("offline");
   });
 
   await syncValves();
-  toast(`Row ${row} selected (valves ${(row-1)*7}–${row*7-1})`);
 };
+
+// =====================================================
+// TIME SELECT
+// =====================================================
+
+document.getElementById("timeSelect").addEventListener("change", async (e) => {
+  const ms = parseInt(e.target.value) || null;
+  await window.api.setDuration(ms);
+  toast(ms ? `Timer set to ${e.target.options[e.target.selectedIndex].text}` : "Timer off — runs until stop");
+});
+
+// =====================================================
+// RANDOM MODE
+// =====================================================
+
+let randomMode = false;
+const randomBtn = document.getElementById("randomBtn");
+
+randomBtn.addEventListener("click", async () => {
+  randomMode = !randomMode;
+  randomBtn.classList.toggle("btn-random-on", randomMode);
+  await window.api.setRandom(randomMode);
+  toast(randomMode ? "Random mode ON — valves cycle independently" : "Random mode OFF");
+});
 
 // =====================================================
 // CLOCK
@@ -313,8 +429,9 @@ async function loadInitialState() {
 
   // Restore active valves from backend default
   activeValves = new Set(state.active_ids || []);
-  document.querySelectorAll(".box").forEach((b, i) => {
-    b.classList.toggle("online", activeValves.has(i));
+  document.querySelectorAll(".box").forEach((b) => {
+    const id = parseInt(b.id.replace("valve-", ""));
+    b.classList.toggle("online", activeValves.has(id));
   });
 
   updateUi(state);

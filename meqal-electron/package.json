@@ -5,6 +5,7 @@
   "main": "src/main.js",
   "scripts": {
     "start": "electron .",
+    "postinstall": "electron-rebuild -f -w socketcan",
     "build": "electron-builder --linux --win --mac",
     "build:linux": "electron-builder --linux",
     "build:win": "electron-builder --win"
@@ -24,10 +25,13 @@
     }
   },
   "devDependencies": {
-    "electron": "^28.0.0",
-    "electron-builder": "^24.0.0"
+    "@electron/rebuild": "^3.7.2",
+    "electron": "^28.3.3",
+    "electron-builder": "^24.13.3"
   },
   "dependencies": {
-    "mqtt": "^5.3.4"
+    "mqtt": "^4.3.7",
+    "net-socket": "^1.1.0",
+    "socketcan": "^4.0.7"
   }
 }

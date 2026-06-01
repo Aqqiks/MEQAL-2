@@ -168,12 +168,6 @@
     color: var(--amber);
   }
 
-  .btn-random-on {
-    background: rgba(59,130,246,0.15);
-    border-color: var(--blue);
-    color: var(--blue);
-  }
-
   .toolbar-sep {
     width: 1px;
     height: 28px;
@@ -427,39 +421,14 @@
   <button class="btn" id="stopBtn">■ Stop</button>
   <div class="toolbar-sep"></div>
   <select class="row-select" id="areaSelect">
-    <option value="" disabled selected>Select area…</option>
-    <optgroup label="Rows — 1×7 (horizontal)">
-      <option value="row-1">Row 1  (1–7)</option>
-      <option value="row-2">Row 2  (8–14)</option>
-      <option value="row-3">Row 3  (15–21)</option>
-      <option value="row-4">Row 4  (22–28)</option>
-      <option value="row-5">Row 5  (29–35)</option>
-      <option value="row-6">Row 6  (36–42)</option>
-      <option value="row-7">Row 7  (43–49)</option>
-    </optgroup>
-    <optgroup label="Columns — 7×1 (vertical)">
-      <option value="col-1">Col 1  (1,8,15,22,29,36,43)</option>
-      <option value="col-2">Col 2  (2,9,16,23,30,37,44)</option>
-      <option value="col-3">Col 3  (3,10,17,24,31,38,45)</option>
-      <option value="col-4">Col 4  (4,11,18,25,32,39,46)</option>
-      <option value="col-5">Col 5  (5,12,19,26,33,40,47)</option>
-      <option value="col-6">Col 6  (6,13,20,27,34,41,48)</option>
-      <option value="col-7">Col 7  (7,14,21,28,35,42,49)</option>
-    </optgroup>
+    <option value="Row 1">Row 1  (valves 0–6)</option>
+    <option value="Row 2">Row 2  (valves 7–13)</option>
+    <option value="Row 3">Row 3  (valves 14–20)</option>
+    <option value="Row 4">Row 4  (valves 21–27)</option>
+    <option value="Row 5">Row 5  (valves 28–34)</option>
+    <option value="Row 6" selected>Row 6  (valves 35–41)</option>
+    <option value="Row 7">Row 7  (valves 42–48)</option>
   </select>
-  <button class="btn" id="selectAllBtn">⊞ All</button>
-  <div class="toolbar-sep"></div>
-  <select class="row-select" id="timeSelect">
-    <option value="0" selected>∞  Until stop</option>
-    <option value="5000">5 s</option>
-    <option value="10000">10 s</option>
-    <option value="30000">30 s</option>
-    <option value="60000">1 min</option>
-    <option value="120000">2 min</option>
-    <option value="300000">5 min</option>
-    <option value="600000">10 min</option>
-  </select>
-  <button class="btn" id="randomBtn">⇌ Random</button>
   <div class="toolbar-sep"></div>
   <button class="btn" id="resetValvesBtn">⊘ Reset Valves</button>
   <button class="btn" id="resetTotalBtn">↺ Reset Total</button>

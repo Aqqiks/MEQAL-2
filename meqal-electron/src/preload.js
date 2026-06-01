@@ -23,6 +23,12 @@ contextBridge.exposeInMainWorld("api", {
   // Mirrors POST /api/valves  { active_ids: [...] }
   setValves: (activeIds) => ipcRenderer.invoke("api:valves", { active_ids: activeIds }),
 
+  // Mirrors POST /api/set_duration  { duration: ms | null }
+  setDuration: (ms) => ipcRenderer.invoke("api:set_duration", { duration: ms }),
+
+  // Mirrors POST /api/set_random  { enabled: bool }
+  setRandom: (enabled) => ipcRenderer.invoke("api:set_random", { enabled }),
+
   // Mirrors POST /api/reset_total
   resetTotal: () => ipcRenderer.invoke("api:reset_total"),
 

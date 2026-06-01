@@ -32,7 +32,7 @@ const sbTime       = document.getElementById("sbTime");
 
 const valveGrid = document.getElementById("valveGrid");
 
-for (let i = 1; i <= VALVE_COUNT; i++) {
+for (let i = 0; i < VALVE_COUNT; i++) {
   const box = document.createElement("div");
   box.className = "box";
   box.id = `valve-${i}`;
@@ -159,7 +159,7 @@ function updateUi(state) {
   // Totals
   totalText.innerText  = total.toFixed(2);
   activeCount.innerText = actCount;
-  flowRateEl.innerText  = flowNow.toFixed(2);
+  flowRateEl.innerText  = (FLOW_RATE_LPS_PER_VALVE * actCount).toFixed(2);
 
   // Running state styling
   isRunning = state.running;
@@ -171,10 +171,10 @@ function updateUi(state) {
 
   // Update valve grid visuals from backend state
   if (state.valve_states) {
-    for (let i = 1; i <= VALVE_COUNT; i++) {
+    state.valve_states.forEach((on, i) => {
       const box = document.getElementById(`valve-${i}`);
-      if (box) box.classList.toggle("online", state.valve_states[i]);
-    }
+      if (box) box.classList.toggle("online", on);
+    });
   }
 
   // Append to main chart
@@ -211,7 +211,6 @@ async function syncValves() {
 
 window.api.onStateUpdate((state) => {
   updateUi(state);
-  if (state.auto_stopped) toast("Timer elapsed — system stopped");
 });
 
 // =====================================================
@@ -278,65 +277,22 @@ document.getElementById("csvBtn").addEventListener("click", async () => {
 // ROW SELECT — activate a full row of 7 valves
 // =====================================================
 
-document.getElementById("selectAllBtn").addEventListener("click", async () => {
-  activeValves.clear();
-  for (let i = 1; i <= VALVE_COUNT; i++) activeValves.add(i);
-  document.querySelectorAll(".box").forEach(b => {
-    b.classList.add("online");
-    b.classList.remove("offline");
-  });
-  await syncValves();
-  toast("All 49 valves selected");
-});
-
 document.getElementById("areaSelect").onchange = async (e) => {
-  const val = e.target.value;
-  if (!val) return;
+  const row = parseInt(e.target.value.replace("Row ", ""));
 
   activeValves.clear();
-
-  if (val.startsWith("row-")) {
-    const row = parseInt(val.slice(4));
-    const start = (row - 1) * 7 + 1;
-    for (let i = start; i < start + 7; i++) activeValves.add(i);
-    toast(`Row ${row} selected (valves ${start}–${start + 6})`);
-  } else if (val.startsWith("col-")) {
-    const col = parseInt(val.slice(4)); // 1-indexed
-    for (let r = 0; r < 7; r++) activeValves.add(col + r * 7);
-    toast(`Col ${col} selected (valves ${col},${col+7},${col+14}…)`);
+  for (let i = (row - 1) * 7; i < row * 7; i++) {
+    activeValves.add(i);
   }
 
   document.querySelectorAll(".box").forEach((b, i) => {
-    b.classList.toggle("online", activeValves.has(i + 1));
+    b.classList.toggle("online", activeValves.has(i));
     b.classList.remove("offline");
   });
 
   await syncValves();
+  toast(`Row ${row} selected (valves ${(row-1)*7}–${row*7-1})`);
 };
-
-// =====================================================
-// TIME SELECT
-// =====================================================
-
-document.getElementById("timeSelect").addEventListener("change", async (e) => {
-  const ms = parseInt(e.target.value) || null;
-  await window.api.setDuration(ms);
-  toast(ms ? `Timer set to ${e.target.options[e.target.selectedIndex].text}` : "Timer off — runs until stop");
-});
-
-// =====================================================
-// RANDOM MODE
-// =====================================================
-
-let randomMode = false;
-const randomBtn = document.getElementById("randomBtn");
-
-randomBtn.addEventListener("click", async () => {
-  randomMode = !randomMode;
-  randomBtn.classList.toggle("btn-random-on", randomMode);
-  await window.api.setRandom(randomMode);
-  toast(randomMode ? "Random mode ON — valves cycle independently" : "Random mode OFF");
-});
 
 // =====================================================
 // CLOCK
@@ -357,9 +313,8 @@ async function loadInitialState() {
 
   // Restore active valves from backend default
   activeValves = new Set(state.active_ids || []);
-  document.querySelectorAll(".box").forEach((b) => {
-    const id = parseInt(b.id.replace("valve-", ""));
-    b.classList.toggle("online", activeValves.has(id));
+  document.querySelectorAll(".box").forEach((b, i) => {
+    b.classList.toggle("online", activeValves.has(i));
   });
 
   updateUi(state);
