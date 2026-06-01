@@ -236,6 +236,11 @@ function updateUi(state) {
   canDot.className = "can-dot " + (connected ? "ok" : "err");
   canStatus.textContent = connected ? "CAN OK" : "NO CAN";
 
+  // Random cap mode badge
+  const capsOn = !!state.random_caps;
+  randomCapsMode = capsOn;
+  randomCapsBtn.classList.toggle("btn-random-on", capsOn);
+
   // Update valve grid visuals from backend state
   if (state.valve_states) {
     for (let i = 1; i <= VALVE_COUNT; i++) {
@@ -420,12 +425,21 @@ document.getElementById("timeSelect").addEventListener("change", async (e) => {
 
 let randomMode = false;
 const randomBtn = document.getElementById("randomBtn");
+const randomCapsBtn = document.getElementById("randomCapsBtn");
+let randomCapsMode = false;
 
 randomBtn.addEventListener("click", async () => {
   randomMode = !randomMode;
   randomBtn.classList.toggle("btn-random-on", randomMode);
   await window.api.setRandom(randomMode);
   toast(randomMode ? "Random mode ON — valves cycle independently" : "Random mode OFF");
+});
+
+randomCapsBtn.addEventListener("click", async () => {
+  const result = await window.api.setRandomCaps();
+  randomCapsMode = !!result.random_caps;
+  randomCapsBtn.classList.toggle("btn-random-on", randomCapsMode);
+  toast(randomCapsMode ? "Natural caps enabled — each valve gets 2–5 dL" : "Natural caps disabled");
 });
 
 // =====================================================
@@ -466,6 +480,11 @@ async function loadInitialState() {
   if (state.valve_flow_limit) {
     const el = document.getElementById("flowCapInput");
     if (el) el.value = (state.valve_flow_limit * 10).toFixed(1);
+  }
+
+  if (state.random_caps) {
+    randomCapsMode = true;
+    randomCapsBtn.classList.add("btn-random-on");
   }
 
   updateUi(state);

@@ -36,7 +36,9 @@ const STATE = {
   randomStates:    {},
   valveFlowLimit:  null,                            // L per valve; null = no limit
   valveFlowAccum:  new Array(VALVE_COUNT + 1).fill(0.0), // per-valve cumulative flow (L)
-  limitedValves:   new Set(),                       // valve IDs that have hit their limit
+  valveFlowCaps:   null,                              // per-valve flow cap in L
+  randomCaps:      false,                             // natural random cap mode active
+  limitedValves:   new Set(),                         // valve IDs that have hit their limit
 };
 
 let mainWindow     = null;
@@ -175,6 +177,14 @@ function tickRandomStates(now) {
 // GAS LOOP
 // =====================================================
 
+function generateRandomValveCaps() {
+  const caps = new Array(VALVE_COUNT + 1).fill(null);
+  for (let i = 1; i <= VALVE_COUNT; i++) {
+    caps[i] = 0.2 + Math.random() * 0.3; // 2–5 dL per valve
+  }
+  return caps;
+}
+
 function gasLoopTick() {
   if (!STATE.running) return;
 
@@ -192,17 +202,17 @@ function gasLoopTick() {
 
   for (const vid of openIds) {
     const increment = FLOW_RATE_LPS * (OPEN_TIME_MS / 1000);
+    const perValveLimit = STATE.valveFlowCaps ? STATE.valveFlowCaps[vid] : null;
+    const effectiveLimit = perValveLimit !== null ? perValveLimit : STATE.valveFlowLimit;
 
-    if (STATE.valveFlowLimit !== null) {
+    if (effectiveLimit !== null) {
       const newAccum = STATE.valveFlowAccum[vid] + increment;
-      if (newAccum >= STATE.valveFlowLimit) {
-        // Valve hits cap — count only the partial flow remaining, then close it
-        const partial = Math.max(0, STATE.valveFlowLimit - STATE.valveFlowAccum[vid]);
-        STATE.valveFlowAccum[vid] = STATE.valveFlowLimit;
+      if (newAccum >= effectiveLimit) {
+        const partial = Math.max(0, effectiveLimit - STATE.valveFlowAccum[vid]);
+        STATE.valveFlowAccum[vid] = effectiveLimit;
         if (partial > 0) { flowInc[vid] = partial; STATE.flow_total += partial; }
         STATE.active_ids   = STATE.active_ids.filter(id => id !== vid);
         STATE.limitedValves.add(vid);
-        // newStates[vid] stays false → valve closes this tick
         continue;
       }
       STATE.valveFlowAccum[vid] = newAccum;
@@ -226,13 +236,14 @@ function gasLoopTick() {
 function pushStateToRenderer(extra = {}) {
   if (!mainWindow || mainWindow.isDestroyed()) return;
   mainWindow.webContents.send("state-update", {
-    running:      STATE.running,
-    active_ids:   STATE.active_ids,
-    flow_total:   STATE.flow_total,
-    flow_history: STATE.flow_history,
-    valve_states:  STATE.valve_states,
-    limited_ids:   Array.from(STATE.limitedValves),
-    can_connected: !!canBus,
+    running:         STATE.running,
+    active_ids:      STATE.active_ids,
+    flow_total:      STATE.flow_total,
+    flow_history:    STATE.flow_history,
+    valve_states:     STATE.valve_states,
+    limited_ids:      Array.from(STATE.limitedValves),
+    can_connected:    !!canBus,
+    random_caps:      STATE.randomCaps,
     ...extra,
   });
 }
@@ -249,6 +260,7 @@ ipcMain.handle("api:state", () => ({
   valve_states:     STATE.valve_states,
   duration:         STATE.duration,
   random:           STATE.random,
+  random_caps:      STATE.randomCaps,
   limited_ids:      Array.from(STATE.limitedValves),
   valve_flow_limit: STATE.valveFlowLimit,
   can_connected:    !!canBus,
@@ -323,6 +335,18 @@ ipcMain.handle("api:set_random", (_event, { enabled }) => {
   if (STATE.random && STATE.running) initRandomStates();
   console.log("[RANDOM] Mode:", STATE.random);
   return { status: "ok", random: STATE.random };
+});
+
+ipcMain.handle("api:set_random_caps", () => {
+  STATE.randomCaps = !STATE.randomCaps;
+  if (STATE.randomCaps) {
+    STATE.valveFlowCaps = generateRandomValveCaps();
+    console.log("[RANDOM CAPS] Enabled — per-valve caps assigned (2–5 dL)");
+  } else {
+    STATE.valveFlowCaps = null;
+    console.log("[RANDOM CAPS] Disabled");
+  }
+  return { status: "ok", random_caps: STATE.randomCaps };
 });
 
 ipcMain.handle("api:set_flow_limit", (_event, { limit }) => {
