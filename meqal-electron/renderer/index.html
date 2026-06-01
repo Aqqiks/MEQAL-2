@@ -365,6 +365,12 @@
     color: rgba(239,68,68,0.5);
   }
 
+  .box.done {
+    background: rgba(245,158,11,0.12);
+    border-color: var(--amber);
+    color: var(--amber);
+  }
+
   /* ── MINI FLOW CHART ── */
   .mini-chart-wrap {
     height: 80px;
@@ -387,6 +393,14 @@
 
   .statusbar-item { display: flex; align-items: center; gap: 6px; }
 
+  .can-dot {
+    width: 6px; height: 6px;
+    border-radius: 50%;
+    background: var(--text-3);
+  }
+  .can-dot.ok  { background: var(--green); }
+  .can-dot.err { background: var(--red); }
+
   /* ── TOAST ── */
   #toast {
     position: fixed;
@@ -405,6 +419,32 @@
     z-index: 999;
   }
   #toast.show { opacity: 1; transform: translateY(0); }
+
+  /* ── FLOW CAP INPUT ── */
+  .toolbar-label {
+    font-family: var(--mono);
+    font-size: 10px;
+    color: var(--text-3);
+    white-space: nowrap;
+    letter-spacing: 0.06em;
+  }
+
+  .flow-cap-input {
+    width: 64px;
+    padding: 7px 8px;
+    border-radius: var(--radius);
+    border: 1px solid var(--border);
+    background: var(--bg-card);
+    color: var(--text-1);
+    font-family: var(--mono);
+    font-size: 12px;
+    -webkit-app-region: no-drag;
+  }
+
+  .flow-cap-input:focus {
+    outline: none;
+    border-color: var(--amber);
+  }
 
   /* ── EMERGENCY FLASH ── */
   @keyframes emergency-flash {
@@ -469,6 +509,10 @@
     <option value="600000">10 min</option>
   </select>
   <button class="btn" id="randomBtn">⇌ Random</button>
+  <div class="toolbar-sep"></div>
+  <div class="toolbar-sep"></div>
+  <span class="toolbar-label">Cap/valve</span>
+  <input type="number" id="flowCapInput" class="flow-cap-input" min="0" step="0.5" placeholder="dL" title="Cumulative flow cap per valve in decilitres">
   <div class="toolbar-sep"></div>
   <button class="btn" id="resetValvesBtn">⊘ Reset Valves</button>
   <button class="btn" id="resetTotalBtn">↺ Reset Total</button>
@@ -536,6 +580,10 @@
   </div>
   <div class="statusbar-item">
     <span id="sbTime">--:--:--</span>
+  </div>
+  <div class="statusbar-item">
+    <span class="can-dot" id="canDot"></span>
+    <span id="canStatus">CAN –</span>
   </div>
   <div class="statusbar-item">
     MEQAL v1.0  ·  Electron

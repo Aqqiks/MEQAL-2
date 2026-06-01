@@ -17,7 +17,7 @@ const FLOW_RATE_LPS    = FLOW_RATE_LPM / 60.0;
 const OPEN_TIME_MS     = 500;
 const RAW_CLOSED       = 290;
 const RAW_OPEN         = 370;
-const CAN_CTRL_TICK_MS = 5;    // one controller per tick; 5 × 5ms = 25ms full cycle (~2ms inter-controller gap)
+const CAN_CTRL_TICK_MS = 20;   // one controller per tick; 20ms × 5 = 100ms full cycle — avoids socketcan buffer overflow at 5ms
 const RANDOM_MIN_MS    = 500;
 const RANDOM_MAX_MS    = 3000;
 
@@ -26,14 +26,17 @@ const RANDOM_MAX_MS    = 3000;
 // =====================================================
 
 const STATE = {
-  running:      false,
-  active_ids:   [],                              // 1-indexed valve IDs set by renderer
-  flow_total:   0.0,
-  flow_history: [],
-  valve_states: new Array(VALVE_COUNT + 1).fill(false), // index 1–49
-  duration:     null,
-  random:       false,
-  randomStates: {},
+  running:         false,
+  active_ids:      [],                              // 1-indexed valve IDs set by renderer
+  flow_total:      0.0,
+  flow_history:    [],
+  valve_states:    new Array(VALVE_COUNT + 1).fill(false), // index 1–49
+  duration:        null,
+  random:          false,
+  randomStates:    {},
+  valveFlowLimit:  null,                            // L per valve; null = no limit
+  valveFlowAccum:  new Array(VALVE_COUNT + 1).fill(0.0), // per-valve cumulative flow (L)
+  limitedValves:   new Set(),                       // valve IDs that have hit their limit
 };
 
 let mainWindow     = null;
@@ -75,10 +78,13 @@ function publishState(states) {
 // Each valve position is a UInt16LE: RAW_CLOSED=290, RAW_OPEN=370.
 // =====================================================
 
+// Create a function to send the correct PDOS for the given controller and their set of open valves
+// We currently have 5 controllers (1-5) annd 49 valves, so the valves are in 7x7 grid, while one controller controls 10 valves
+// Except the last one controls only 9 valves, so we need to be careful with the indexing
 function sendCtrlPdos(ctrl, openSet) {
-  if (!canBus) return;
-  const base = (ctrl - 1) * 10;
-  const vals = [];
+  if (!canBus) return; // safety check, no clocking the can bus if it's not set up
+  const base = (ctrl - 1) * 10; // base index for the valves this controller manages
+  const vals = []; 
   for (let i = 0; i < 10; i++) {
     const vid = base + i + 1;                   // 1-indexed valve ID
     vals.push(vid <= VALVE_COUNT && openSet.has(vid) ? RAW_OPEN : RAW_CLOSED);
@@ -167,6 +173,7 @@ function tickRandomStates(now) {
 
 function gasLoopTick() {
   if (!STATE.running) return;
+  if (!canBus) return;  // No CAN connection — don't accumulate flow or update charts
 
   const now       = Date.now();
   const flowInc   = new Array(VALVE_COUNT + 1).fill(0.0);
@@ -181,10 +188,26 @@ function gasLoopTick() {
   }
 
   for (const vid of openIds) {
-    const increment    = FLOW_RATE_LPS * (OPEN_TIME_MS / 1000);
-    flowInc[vid]       = increment;
-    STATE.flow_total  += increment;
-    newStates[vid]     = true;
+    const increment = FLOW_RATE_LPS * (OPEN_TIME_MS / 1000);
+
+    if (STATE.valveFlowLimit !== null) {
+      const newAccum = STATE.valveFlowAccum[vid] + increment;
+      if (newAccum >= STATE.valveFlowLimit) {
+        // Valve hits cap — count only the partial flow remaining, then close it
+        const partial = Math.max(0, STATE.valveFlowLimit - STATE.valveFlowAccum[vid]);
+        STATE.valveFlowAccum[vid] = STATE.valveFlowLimit;
+        if (partial > 0) { flowInc[vid] = partial; STATE.flow_total += partial; }
+        STATE.active_ids   = STATE.active_ids.filter(id => id !== vid);
+        STATE.limitedValves.add(vid);
+        // newStates[vid] stays false → valve closes this tick
+        continue;
+      }
+      STATE.valveFlowAccum[vid] = newAccum;
+    }
+
+    flowInc[vid]      = increment;
+    STATE.flow_total += increment;
+    newStates[vid]    = true;
   }
 
   STATE.valve_states = newStates;
@@ -204,7 +227,9 @@ function pushStateToRenderer(extra = {}) {
     active_ids:   STATE.active_ids,
     flow_total:   STATE.flow_total,
     flow_history: STATE.flow_history,
-    valve_states: STATE.valve_states,
+    valve_states:  STATE.valve_states,
+    limited_ids:   Array.from(STATE.limitedValves),
+    can_connected: !!canBus,
     ...extra,
   });
 }
@@ -214,13 +239,16 @@ function pushStateToRenderer(extra = {}) {
 // =====================================================
 
 ipcMain.handle("api:state", () => ({
-  running:      STATE.running,
-  active_ids:   STATE.active_ids,
-  flow_total:   STATE.flow_total,
-  flow_history: STATE.flow_history,
-  valve_states: STATE.valve_states,
-  duration:     STATE.duration,
-  random:       STATE.random,
+  running:          STATE.running,
+  active_ids:       STATE.active_ids,
+  flow_total:       STATE.flow_total,
+  flow_history:     STATE.flow_history,
+  valve_states:     STATE.valve_states,
+  duration:         STATE.duration,
+  random:           STATE.random,
+  limited_ids:      Array.from(STATE.limitedValves),
+  valve_flow_limit: STATE.valveFlowLimit,
+  can_connected:    !!canBus,
 }));
 
 ipcMain.handle("api:start", () => {
@@ -267,7 +295,15 @@ ipcMain.handle("api:emergency", () => {
 });
 
 ipcMain.handle("api:valves", (_event, { active_ids }) => {
-  STATE.active_ids = active_ids || [];
+  const incoming = new Set(active_ids || []);
+  // Re-activating a previously capped valve resets its counter
+  for (const id of incoming) {
+    if (STATE.limitedValves.has(id)) {
+      STATE.limitedValves.delete(id);
+      STATE.valveFlowAccum[id] = 0.0;
+    }
+  }
+  STATE.active_ids = Array.from(incoming);
   if (STATE.random && STATE.running) initRandomStates();
   console.log("[VALVES] Active IDs:", STATE.active_ids);
   return { status: "ok", active_ids: STATE.active_ids };
@@ -286,9 +322,17 @@ ipcMain.handle("api:set_random", (_event, { enabled }) => {
   return { status: "ok", random: STATE.random };
 });
 
+ipcMain.handle("api:set_flow_limit", (_event, { limit }) => {
+  STATE.valveFlowLimit = (limit && limit > 0) ? limit : null;
+  console.log("[FLOW LIMIT] Set to:", STATE.valveFlowLimit, "L");
+  return { status: "ok", limit: STATE.valveFlowLimit };
+});
+
 ipcMain.handle("api:reset_total", () => {
-  STATE.flow_total   = 0.0;
-  STATE.flow_history = [];
+  STATE.flow_total     = 0.0;
+  STATE.flow_history   = [];
+  STATE.valveFlowAccum = new Array(VALVE_COUNT + 1).fill(0.0);
+  STATE.limitedValves  = new Set();
   return { status: "reset" };
 });
 

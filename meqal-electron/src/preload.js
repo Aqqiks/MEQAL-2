@@ -29,6 +29,9 @@ contextBridge.exposeInMainWorld("api", {
   // Mirrors POST /api/set_random  { enabled: bool }
   setRandom: (enabled) => ipcRenderer.invoke("api:set_random", { enabled }),
 
+  // Set per-valve cumulative flow cap (L); pass null to disable
+  setFlowLimit: (limitL) => ipcRenderer.invoke("api:set_flow_limit", { limit: limitL }),
+
   // Mirrors POST /api/reset_total
   resetTotal: () => ipcRenderer.invoke("api:reset_total"),
 

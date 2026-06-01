@@ -25,6 +25,8 @@ const sysStatus    = document.getElementById("sysStatus");
 const pulseDot     = document.getElementById("pulseDot");
 const sbStatus     = document.getElementById("sbStatus");
 const sbTime       = document.getElementById("sbTime");
+const canStatus    = document.getElementById("canStatus");
+const canDot       = document.getElementById("canDot");
 
 // =====================================================
 // BUILD VALVE GRID (7×7 = 49 boxes)
@@ -44,6 +46,7 @@ for (let i = 1; i <= VALVE_COUNT; i++) {
       box.classList.remove("online");
     } else {
       activeValves.add(i);
+      box.classList.remove("done");
       box.classList.add("online");
     }
     syncValves();
@@ -228,6 +231,11 @@ function updateUi(state) {
     ? `Running · ${actCount} valves active`
     : "System idle";
 
+  // CAN connection badge
+  const connected = !!state.can_connected;
+  canDot.className = "can-dot " + (connected ? "ok" : "err");
+  canStatus.textContent = connected ? "CAN OK" : "NO CAN";
+
   // Update valve grid visuals from backend state
   if (state.valve_states) {
     for (let i = 1; i <= VALVE_COUNT; i++) {
@@ -236,8 +244,17 @@ function updateUi(state) {
     }
   }
 
+  // Mark capped valves as "done" in the grid
+  if (state.limited_ids) {
+    for (const vid of state.limited_ids) {
+      activeValves.delete(vid);
+      const box = document.getElementById(`valve-${vid}`);
+      if (box && !box.classList.contains("online")) box.classList.add("done");
+    }
+  }
+
   // Per-valve cumulative flow accumulation (0.5 s tick)
-  if (state.valve_states && isRunning) {
+  if (state.valve_states && state.running) {
     const tickFlow = FLOW_RATE_LPS_PER_VALVE * 0.5;
     for (let i = 1; i <= VALVE_COUNT; i++) {
       if (state.valve_states[i]) valveCumulativeFlow[i - 1] += tickFlow;
@@ -316,7 +333,7 @@ document.getElementById("emergencyBtn").addEventListener("click", async () => {
 
 document.getElementById("resetValvesBtn").addEventListener("click", async () => {
   activeValves.clear();
-  document.querySelectorAll(".box").forEach(b => b.classList.remove("online", "offline"));
+  document.querySelectorAll(".box").forEach(b => b.classList.remove("online", "offline", "done"));
   await syncValves();
   toast("Valves reset");
 });
@@ -334,6 +351,7 @@ document.getElementById("resetTotalBtn").addEventListener("click", async () => {
   mainChart.update();
   miniChart.update();
   valveChart.update();
+  document.querySelectorAll(".box.done").forEach(b => b.classList.remove("done"));
   toast("Total flow reset");
 });
 
@@ -411,6 +429,17 @@ randomBtn.addEventListener("click", async () => {
 });
 
 // =====================================================
+// FLOW CAP INPUT
+// =====================================================
+
+document.getElementById("flowCapInput").addEventListener("change", async (e) => {
+  const dl = parseFloat(e.target.value);
+  const limitL = (dl > 0) ? dl * 0.1 : null;
+  await window.api.setFlowLimit(limitL);
+  toast(limitL ? `Flow cap: ${dl} dL/valve` : "Flow cap disabled");
+});
+
+// =====================================================
 // CLOCK
 // =====================================================
 
@@ -433,6 +462,11 @@ async function loadInitialState() {
     const id = parseInt(b.id.replace("valve-", ""));
     b.classList.toggle("online", activeValves.has(id));
   });
+
+  if (state.valve_flow_limit) {
+    const el = document.getElementById("flowCapInput");
+    if (el) el.value = (state.valve_flow_limit * 10).toFixed(1);
+  }
 
   updateUi(state);
 }
