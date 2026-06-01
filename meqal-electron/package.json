@@ -6,6 +6,7 @@
   "scripts": {
     "start": "electron .",
     "postinstall": "electron-rebuild -f -w socketcan",
+    "rebuild:socketcan": "electron-rebuild -f -w socketcan",
     "build": "electron-builder --linux --win --mac",
     "build:linux": "electron-builder --linux",
     "build:win": "electron-builder --win"

@@ -45,6 +45,7 @@ let canRefreshTimer = null;
 let autoStopTimer  = null;
 let mqttClient     = null;
 let canBus         = null;
+let canSimulated   = false;
 
 // =====================================================
 // MQTT (optional)
@@ -114,6 +115,7 @@ function setupCan() {
     const can = require("socketcan");
     canBus = can.createRawChannel("can0", true);
     canBus.start();
+    canSimulated = false;
     console.log("[CAN] Connected to can0");
 
     // NMT Start All Nodes — move every CANopen node Pre-Operational → Operational
@@ -138,6 +140,8 @@ function setupCan() {
   } catch (e) {
     console.warn("[CAN] Not available:", e.message);
     canBus = null;
+    canSimulated = true;
+    console.warn("[CAN] Running in simulation mode.");
   }
 }
 
@@ -173,7 +177,6 @@ function tickRandomStates(now) {
 
 function gasLoopTick() {
   if (!STATE.running) return;
-  if (!canBus) return;  // No CAN connection — don't accumulate flow or update charts
 
   const now       = Date.now();
   const flowInc   = new Array(VALVE_COUNT + 1).fill(0.0);

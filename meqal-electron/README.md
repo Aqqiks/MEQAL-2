@@ -44,6 +44,12 @@ Output goes to `dist/`.
 - Requires `socketcan` npm package and a `can0` interface on Linux
 - If CAN is not available, the app runs in simulation mode (no crash)
 - To install: `npm install socketcan`
+- If Electron fails to load the native addon, rebuild it for Electron with:
+
+```bash
+cd meqal-electron
+npx electron-rebuild -f -w socketcan
+```
 
 ### MQTT
 - Requires a broker running on `localhost:1883`
