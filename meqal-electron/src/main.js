@@ -341,11 +341,14 @@ ipcMain.handle("api:set_random_caps", () => {
   STATE.randomCaps = !STATE.randomCaps;
   if (STATE.randomCaps) {
     STATE.valveFlowCaps = generateRandomValveCaps();
-    console.log("[RANDOM CAPS] Enabled — per-valve caps assigned (2–5 dL)");
+    STATE.active_ids = Array.from({ length: VALVE_COUNT }, (_, i) => i + 1);
+    STATE.valve_states = new Array(VALVE_COUNT + 1).fill(true);
+    console.log("[RANDOM CAPS] Enabled — all valves open with individual caps (2–5 dL)");
   } else {
     STATE.valveFlowCaps = null;
     console.log("[RANDOM CAPS] Disabled");
   }
+  pushStateToRenderer();
   return { status: "ok", random_caps: STATE.randomCaps };
 });
 
