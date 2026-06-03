@@ -1,8 +1,7 @@
-// =====================================================
+
 // MEQAL PRELOAD — IPC BRIDGE
 // Exposes a safe window.api object to the renderer
 // Replaces Flask fetch() calls with Electron IPC
-// =====================================================
 
 const { contextBridge, ipcRenderer } = require("electron");
 
