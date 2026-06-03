@@ -47,6 +47,7 @@ let mainWindow     = null;                          // reference to the main app
 let gasLoopTimer   = null;                          // timer for the main gas loop that updates flow and states
 let canRefreshTimer = null;                         // timer for refreshing the CAN bus with the current valve states at regular intervals
 let autoStopTimer  = null;                          // timer for auto-stopping the system after a specified duration
+let connectionRefreshTimer = null;                  // timer for periodic MQTT and CAN connection healing
 let mqttClient     = null;                          // MQTT client instance for publishing flow and state updates to an MQTT broker
 let canBus         = null;                          // CAN bus channel for communicating with the valve controllers; if null, CAN is not available
 let canSimulated   = false;                         // flag to indicate if we're running in simulation mode without actual CAN communication (e.g., if socketcan is not available or
@@ -64,6 +65,13 @@ function setupMqtt() {
     mqttClient.on("error",   (err) => { console.warn("[MQTT] Not available:", err.message); mqttClient = null; });
   } catch (e) {
     console.warn("[MQTT] Module not available:", e.message);
+  }
+}
+
+function refreshMqttConnection() {
+  if (!mqttClient || !mqttClient.connected) {
+    console.log("[MQTT] Attempting reconnection...");
+    setupMqtt();
   }
 }
 
@@ -161,6 +169,13 @@ function setupCan() {
   }
 }
 
+function refreshCanConnection() {
+  if (!canBus) {
+    console.log("[CAN] Attempting reconnection...");
+    setupCan();
+  }
+}
+
 // RANDOM MODE
 // In random mode, the valves in active_ids toggle open/closed at random intervals between RANDOM_MIN_MS and RANDOM_MAX_MS. 
 // This is implemented by maintaining a randomStates object that tracks the current open state and next toggle time for each active valve ID. 
@@ -202,7 +217,7 @@ function initNaturalCycleStates() {
   STATE.active_ids.forEach(id => {
     const cap   = STATE.valveFlowCaps ? STATE.valveFlowCaps[id] : 0.2 + Math.random() * 0.3;
     const openMs = (cap / FLOW_RATE_LPS) * 1000;
-    STATE.naturalCycleStates[id] = { phase: 'open', nextSwitch: now + openMs };
+    STATE.naturalCycleStates[id] = { phase: 'open', nextSwitch: now + openMs, cycleFlow: 0 };
   });
 }
 
@@ -211,10 +226,15 @@ function tickNaturalCycleStates(now) {
     if (!STATE.naturalCycleStates[id]) {
       const cap   = STATE.valveFlowCaps ? STATE.valveFlowCaps[id] : 0.2 + Math.random() * 0.3;
       const openMs = (cap / FLOW_RATE_LPS) * 1000;
-      STATE.naturalCycleStates[id] = { phase: 'open', nextSwitch: now + openMs };
+      STATE.naturalCycleStates[id] = { phase: 'open', nextSwitch: now + openMs, cycleFlow: 0 };
     }
     const s = STATE.naturalCycleStates[id];
-    if (now >= s.nextSwitch) {
+    const cap = STATE.valveFlowCaps ? STATE.valveFlowCaps[id] : 0.2 + Math.random() * 0.3;
+    // Check if accumulated cycle flow exceeds cap during open phase and close if needed
+    if (s.phase === 'open' && s.cycleFlow >= cap) {
+      s.phase = 'closed';
+      s.nextSwitch = now + RANDOM_MIN_MS + Math.random() * (RANDOM_MAX_MS - RANDOM_MIN_MS);
+    } else if (now >= s.nextSwitch) {
       if (s.phase === 'open') {
         // valve has been open long enough — close it for a random pause
         s.phase = 'closed';
@@ -225,6 +245,7 @@ function tickNaturalCycleStates(now) {
         const newCap = 0.2 + Math.random() * 0.3;
         STATE.valveFlowCaps[id] = newCap;
         s.nextSwitch = now + (newCap / FLOW_RATE_LPS) * 1000;
+        s.cycleFlow = 0;  // Reset per-cycle flow counter when reopening
       }
     }
   });
@@ -250,15 +271,14 @@ function generateRandomValveCaps() {
 // Finally, it updates the total flow, history, publishes the new state to MQTT, and pushes the updated state to the renderer.
 function gasLoopTick() {
   if (!STATE.running) return;
-  // We get the current time to use for calculating flow increments and managing random state toggling. 
-  // We also initialize arrays to track the flow increments for each valve and the new states of the valves after this tick.
   const now       = Date.now();
   const flowInc   = new Array(VALVE_COUNT + 1).fill(0.0);
   const newStates = new Array(VALVE_COUNT + 1).fill(false);
-  // Determine which valves are currently open based on the active mode.
+  
+  // Determine which valves are currently open based on the active mode (random, natural, or normal).
   let openIds;
   if (STATE.randomCaps) {
-    // Natural cycle mode: timing-based open/close like the Python system
+    if (!STATE.valveFlowCaps) STATE.valveFlowCaps = generateRandomValveCaps();
     tickNaturalCycleStates(now);
     openIds = STATE.active_ids.filter(id => STATE.naturalCycleStates[id]?.phase === 'open');
   } else if (STATE.random) {
@@ -267,40 +287,66 @@ function gasLoopTick() {
   } else {
     openIds = STATE.active_ids;
   }
-  // We loop through the currently open valves and calculate the flow increment for each based on the defined flow rate and the time step.
+  
+  // Process each open valve with unified cap/limit enforcement across all modes
   for (const vid of openIds) {
     const increment = FLOW_RATE_LPS * (OPEN_TIME_MS / 1000);
-
-    if (STATE.randomCaps) {
-      // Natural cycle mode: timing controls open/close, just track accumulated flow
-      STATE.valveFlowAccum[vid] = (STATE.valveFlowAccum[vid] || 0) + increment;
-      flowInc[vid]      = increment;
-      STATE.flow_total += increment;
-      newStates[vid]    = true;
-    } else {
-      const perValveLimit  = STATE.valveFlowCaps ? STATE.valveFlowCaps[vid] : null;
-      const effectiveLimit = perValveLimit !== null ? perValveLimit : STATE.valveFlowLimit;
-      // If there is a flow limit (either global or per-valve), we check if adding the full increment would exceed the limit. If it does,
-      // -> we calculate the partial increment that would reach the limit, update the accumulated flow to the limit, and mark the valve as closed for
-      // -> the next state. We also add the partial increment to the total flow if it's greater than 0. If we haven't hit the limit,
-      // we simply update the accumulated flow for this valve.
-      if (effectiveLimit !== null) {
-        const newAccum = STATE.valveFlowAccum[vid] + increment;
-        if (newAccum >= effectiveLimit) {
-          const partial = Math.max(0, effectiveLimit - STATE.valveFlowAccum[vid]);
-          STATE.valveFlowAccum[vid] = effectiveLimit;
-          if (partial > 0) { flowInc[vid] = partial; STATE.flow_total += partial; }
-          STATE.active_ids   = STATE.active_ids.filter(id => id !== vid);
-          STATE.limitedValves.add(vid);
-          continue;
-        }
-        STATE.valveFlowAccum[vid] = newAccum;
+    
+    // Determine the effective cap for this valve (per-valve caps override global limits)
+    let effectiveCap = null;
+    if (STATE.randomCaps && STATE.valveFlowCaps) {
+      // In natural mode, the cycle cap applies per cycle
+      effectiveCap = STATE.valveFlowCaps[vid];
+    } else if (STATE.valveFlowLimit) {
+      // Otherwise, use global per-valve flow limit if set
+      effectiveCap = STATE.valveFlowLimit;
+    }
+    
+    // Check if this valve has already hit its cap
+    if (effectiveCap !== null && STATE.valveFlowAccum[vid] >= effectiveCap) {
+      STATE.active_ids = STATE.active_ids.filter(id => id !== vid);
+      STATE.limitedValves.add(vid);
+      continue;
+    }
+    
+    // Calculate how much flow to add, respecting the cap
+    let flowToAdd = increment;
+    let shouldClose = false;
+    
+    if (effectiveCap !== null) {
+      const newAccum = STATE.valveFlowAccum[vid] + increment;
+      if (newAccum >= effectiveCap) {
+        // This tick would exceed the cap — clamp to cap and mark as closed
+        flowToAdd = Math.max(0, effectiveCap - STATE.valveFlowAccum[vid]);
+        shouldClose = true;
       }
-      flowInc[vid]      = increment;
-      STATE.flow_total += increment;
-      newStates[vid]    = true;
+    }
+    
+    // Update accumulation and total flow if there's flow to add
+    if (flowToAdd > 0) {
+      STATE.valveFlowAccum[vid] = (STATE.valveFlowAccum[vid] || 0) + flowToAdd;
+      flowInc[vid] = flowToAdd;
+      STATE.flow_total += flowToAdd;
+      newStates[vid] = true;
+      
+      // Track per-cycle flow in natural mode
+      if (STATE.randomCaps && STATE.naturalCycleStates[vid]) {
+        STATE.naturalCycleStates[vid].cycleFlow = (STATE.naturalCycleStates[vid].cycleFlow || 0) + flowToAdd;
+      }
+    }
+    
+    // If cap is hit in any mode, close the valve and mark as limited
+    if (shouldClose && effectiveCap !== null) {
+      STATE.active_ids = STATE.active_ids.filter(id => id !== vid);
+      STATE.limitedValves.add(vid);
+      // In natural mode, also transition to closed phase
+      if (STATE.randomCaps && STATE.naturalCycleStates[vid]) {
+        STATE.naturalCycleStates[vid].phase = 'closed';
+        STATE.naturalCycleStates[vid].nextSwitch = now + RANDOM_MIN_MS + Math.random() * (RANDOM_MAX_MS - RANDOM_MIN_MS);
+      }
     }
   }
+  
   // Update the global valve states based on the new calculations
   STATE.valve_states = newStates;
   // Record the flow history for graphing, keeping only the last 60 entries (e.g., last 5 minutes if OPEN_TIME_MS is 500ms)
@@ -371,6 +417,7 @@ ipcMain.handle("api:start", () => {
   // If the gas loop timer is not already running, we start it to begin processing the flow updates at regular intervals defined by OPEN_TIME_MS.
   if (!gasLoopTimer) gasLoopTimer = setInterval(gasLoopTick, OPEN_TIME_MS);
   console.log("[SYSTEM] Started — duration:", STATE.duration, "random:", STATE.random);
+  pushStateToRenderer();
   return { status: "started" };
 });
 
@@ -404,18 +451,16 @@ ipcMain.handle("api:valves", (_event, { active_ids }) => {
   const incoming = new Set(active_ids || []);
   // Re-activating a previously capped valve resets its counter
   for (const id of incoming) {
-    // If the incoming set of active IDs includes a valve ID that is currently in the limitedValves set (indicating it has hit its flow limit), we remove it from the limitedValves set 
-    //  -> and reset its accumulated flow to 0. This allows the valve to be re-activated with a fresh state, rather than being stuck in a limited state due to previous usage.
-    if (STATE.limitedValves.has(id)) { // Check if the valve ID is in the limitedValves set
+    if (STATE.limitedValves.has(id)) {
       STATE.limitedValves.delete(id);
       STATE.valveFlowAccum[id] = 0.0;
     }
   }
-  // Update the active_ids in the state with the new set of active valve IDs. If random mode is enabled and the system is running, 
-  // -> we also re-initialize the random states to reflect any changes in the active valves.
-  STATE.active_ids = Array.from(incoming); // Ensure it's an array
+  STATE.active_ids = Array.from(incoming);
   if (STATE.random && STATE.running) initRandomStates();
+  if (STATE.randomCaps && STATE.running) initNaturalCycleStates();
   console.log("[VALVES] Active IDs:", STATE.active_ids);
+  pushStateToRenderer();
   return { status: "ok", active_ids: STATE.active_ids };
 });
 
@@ -438,16 +483,16 @@ ipcMain.handle("api:set_random", (_event, { enabled }) => {
 // When disabled, it clears the caps. It also logs the new mode and pushes the updated state to the renderer.
 ipcMain.handle("api:set_random_caps", () => {
   STATE.randomCaps = !STATE.randomCaps;
-  if (STATE.randomCaps) { // Enabling natural mode: generate random caps and initialise per-valve cycle timing.
+  if (STATE.randomCaps) {
     STATE.valveFlowCaps = generateRandomValveCaps();
-    STATE.active_ids    = Array.from({ length: VALVE_COUNT }, (_, i) => i + 1);
-    STATE.valve_states  = new Array(VALVE_COUNT + 1).fill(true);
+    STATE.naturalCycleStates = {};
     if (STATE.running) initNaturalCycleStates();
-    console.log("[NATURAL] Enabled — valves cycle with random open durations (2–5 dL) and random close pauses");
-  } else { // Disabling random caps mode clears the per-valve caps and allows all valves to operate without individual limits, relying only on any global flow limit if set.
+    console.log("[NATURAL] Enabled — selected valves cycle with random open durations (2–5 dL)");
+  } else {
     STATE.valveFlowCaps = null;
-    console.log("[RANDOM CAPS] Disabled");
-  } // Whenever we toggle the random caps mode, we also want to push the updated state to the renderer so that it can reflect the new caps and any changes in valve states.
+    STATE.naturalCycleStates = {};
+    console.log("[NATURAL] Disabled");
+  }
   pushStateToRenderer();
   return { status: "ok", random_caps: STATE.randomCaps };
 });
@@ -467,6 +512,18 @@ ipcMain.handle("api:reset_total", () => {
   STATE.flow_history   = [];
   STATE.valveFlowAccum = new Array(VALVE_COUNT + 1).fill(0.0);
   STATE.limitedValves  = new Set();
+  return { status: "reset" };
+});
+
+// Reset per-valve flow accumulators, caps, and limited valve set to allow all valves to flow freely again
+ipcMain.handle("api:reset_caps", () => {
+  STATE.valveFlowAccum = new Array(VALVE_COUNT + 1).fill(0.0);
+  STATE.limitedValves  = new Set();
+  STATE.valveFlowCaps  = null;
+  STATE.valveFlowLimit = null;
+  STATE.naturalCycleStates = {};
+  console.log("[CAPS] Reset all valve accumulators and limits");
+  pushStateToRenderer();
   return { status: "reset" };
 });
 
@@ -523,6 +580,11 @@ app.whenReady().then(() => {
   setupCan();
   createWindow();
   gasLoopTimer = setInterval(gasLoopTick, OPEN_TIME_MS);
+  // Periodically attempt to heal MQTT and CAN connections every 30 seconds
+  connectionRefreshTimer = setInterval(() => {
+    refreshMqttConnection();
+    refreshCanConnection();
+  }, 30000);
 });
 
 // When all windows are closed, we clear any running timers, send a command to close all valves, end the MQTT connection if it exists, and quit the application.
@@ -530,6 +592,7 @@ app.on("window-all-closed", () => {
   if (gasLoopTimer)    clearInterval(gasLoopTimer); // Clear the gas loop timer to stop processing flow updates
   if (canRefreshTimer) clearInterval(canRefreshTimer); // Clear the CAN refresh timer to stop sending PDOs to the CAN bus
   if (autoStopTimer)   clearTimeout(autoStopTimer); // Clear the auto-stop timer to prevent it from triggering after the windows are closed
+  if (connectionRefreshTimer) clearInterval(connectionRefreshTimer); // Clear the connection refresh timer to stop attempting healing
   sendAllClosed(); // Send a command to the CAN bus to set all valves to the closed state, ensuring that the system is left in a safe state when the application is closed
   if (mqttClient) mqttClient.end(); // End the MQTT connection gracefully if it was established
   app.quit(); // Quit the Electron application, which will close all windows and exit the process

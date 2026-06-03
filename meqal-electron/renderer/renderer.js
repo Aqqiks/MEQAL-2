@@ -73,7 +73,7 @@ const valveChartCtx = document.getElementById("valveChartCanvas").getContext("2d
 const valveChartData = {
   labels: valveLabels,
   datasets: [{
-    label:           "Cumulative Flow (L)",
+    label:           "Cumulative Flow (dL)",
     data:            [...valveCumulativeFlow],
     backgroundColor: "rgba(34,197,94,0.45)",
     borderColor:     "#22c55e",
@@ -99,6 +99,11 @@ const valveChart = new Chart(valveChartCtx, {
         titleColor:      "#7a8fa8",
         bodyColor:       "#e2eaf4",
         bodyFont:        { family: "JetBrains Mono", size: 12 },
+        callbacks: {
+          label: function(context) {
+            return ((context.parsed.y || 0) * 10).toFixed(3) + " dL";
+          }
+        }
       }
     },
     scales: {
@@ -113,8 +118,14 @@ const valveChart = new Chart(valveChartCtx, {
         grid: { color: "rgba(30,45,61,0.6)" },
       },
       y: {
-        ticks:       { color: "#3d5268", font: { family: "JetBrains Mono", size: 9 } },
-        grid:        { color: "rgba(30,45,61,0.6)" },
+        ticks: {
+          color: "#3d5268",
+          font: { family: "JetBrains Mono", size: 9 },
+          callback: function(value) {
+            return (value * 10).toFixed(3);
+          }
+        },
+        grid: { color: "rgba(30,45,61,0.6)" },
         beginAtZero: true,
       }
     }
@@ -126,12 +137,12 @@ const valveChart = new Chart(valveChartCtx, {
 // A live line chart showing the instantaneous flow rate (L/s) over time, derived from the flow_history array sent by the main process.
 const chartCtx = document.getElementById("chartCanvas").getContext("2d");
 
-// The chartData object holds the labels (timestamps) and dataset (flow rates) for the main flow chart. It is updated on every state tick with the latest 
-// -> flow_history data from the backend, showing the real-time flow dynamics of the system.
+// The chartData object holds the labels (timestamps) and dataset (cumulative flow per valve) for the main flow chart. It is updated on every state tick with the latest 
+// -> flow_history data from the backend, showing the cumulative flow contribution per active valve over time.
 const chartData = {
   labels: [],
   datasets: [{
-    label:           "Flow Rate (L/s)",
+    label:           "Cumulative Flow Per Valve (L)",
     data:            [],
     borderColor:     "#22c55e",
     backgroundColor: "rgba(34,197,94,0.08)",
@@ -160,6 +171,11 @@ const mainChart = new Chart(chartCtx, {
         titleColor:      "#7a8fa8",
         bodyColor:       "#e2eaf4",
         bodyFont:        { family: "JetBrains Mono", size: 12 },
+        callbacks: {
+          label: function(context) {
+            return (context.parsed.y || 0).toFixed(3) + " L";
+          }
+        }
       }
     },
     scales: {
@@ -168,8 +184,14 @@ const mainChart = new Chart(chartCtx, {
         grid:  { color: "rgba(30,45,61,0.6)" },
       },
       y: {
-        ticks:       { color: "#3d5268", font: { family: "JetBrains Mono", size: 9 } },
-        grid:        { color: "rgba(30,45,61,0.6)" },
+        ticks: {
+          color: "#3d5268",
+          font: { family: "JetBrains Mono", size: 9 },
+          callback: function(value) {
+            return value.toFixed(3);
+          }
+        },
+        grid: { color: "rgba(30,45,61,0.6)" },
         beginAtZero: true,
       }
     }
@@ -204,13 +226,36 @@ const miniChart = new Chart(miniCtx, {
     responsive:          true,
     maintainAspectRatio: false,
     animation:           false,
-    plugins: { legend: { display: false }, tooltip: { enabled: false } },
+    plugins: {
+      legend: { display: false },
+      tooltip: {
+        enabled: true,
+        backgroundColor: "#0e1318",
+        borderColor:     "#1e2d3d",
+        borderWidth:     1,
+        titleColor:      "#7a8fa8",
+        bodyColor:       "#e2eaf4",
+        bodyFont:        { family: "JetBrains Mono", size: 12 },
+        callbacks: {
+          label: function(context) {
+            return (context.parsed.y || 0).toFixed(3) + " L";
+          }
+        }
+      }
+    },
     scales: {
       x: { display: false },
       y: {
         display:     true,
-        ticks:       { color: "#3d5268", font: { family: "JetBrains Mono", size: 8 }, maxTicksLimit: 4 },
-        grid:        { color: "rgba(30,45,61,0.4)" },
+        ticks: {
+          color: "#3d5268",
+          font: { family: "JetBrains Mono", size: 8 },
+          maxTicksLimit: 4,
+          callback: function(value) {
+            return value.toFixed(3);
+          }
+        },
+        grid: { color: "rgba(30,45,61,0.4)" },
         beginAtZero: true,
       }
     }
@@ -257,12 +302,19 @@ function updateUi(state) {
   randomCapsMode = capsOn;
   randomCapsBtn.classList.toggle("btn-random-on", capsOn);
 
-  // Refresh the valve grid boxes to show which valves are currently open according to backend state
-  if (state.valve_states) {
-    for (let i = 1; i <= VALVE_COUNT; i++) {
-      const box = document.getElementById(`valve-${i}`);
-      if (box) box.classList.toggle("online", state.valve_states[i]);
-    }
+  // Ensure the UI selection stays in sync with the backend active valve IDs.
+  activeValves = new Set(state.active_ids || activeValves);
+
+  // Refresh the valve grid boxes to show selection and current open state. Selected valves remain highlighted
+  // even if the backend has temporarily closed them during random/natural cycling.
+  for (let i = 1; i <= VALVE_COUNT; i++) {
+    const box = document.getElementById(`valve-${i}`);
+    if (!box) continue;
+    const isSelected = activeValves.has(i);
+    const isOpen     = state.valve_states ? !!state.valve_states[i] : false;
+    box.classList.toggle("online", isSelected || isOpen);
+    box.classList.toggle("offline", false);
+    if (!isSelected && !isOpen) box.classList.remove("done");
   }
 
   // Mark any valves that have reached their cumulative flow cap as "done" (amber) in the grid
@@ -287,15 +339,18 @@ function updateUi(state) {
   // Rebuild the main flow rate chart and mini history sparkline from the latest flow_history array
   if (state.flow_history && state.flow_history.length > 0) {
     const history = state.flow_history;
-    // The main chart plots the instantaneous flow rate over time, calculated as the difference between consecutive total flow values in the history (multiplied by 2 to convert from 0.5s ticks to L/s).
+    const activeCount = (state.active_ids || []).length || 1; // Avoid division by zero
+    // The main chart plots cumulative flow per valve over time. Divide total cumulative flow by active valve count
+    // to show how much each valve has contributed to the total (on average across active valves).
+    // When valves close/cap, activeCount decreases, which properly flattens the per-valve contribution.
     chartData.labels           = history.map(h => new Date(h.time).toLocaleTimeString());
-    chartData.datasets[0].data = history.map((h, i) =>
-      i === 0 ? 0 : parseFloat(((h.value - history[i - 1].value) * 2).toFixed(4))
-    );
+    chartData.datasets[0].data = history.map(h => {
+      return parseFloat((h.value / activeCount).toFixed(3));
+    });
     mainChart.update("none");
-    // The mini chart plots the cumulative total flow over time, using the same history data but showing the total value instead of the rate.
+    // The mini chart plots the cumulative total flow over time, using the same history data but showing the total value.
     miniData.labels              = chartData.labels;
-    miniData.datasets[0].data    = history.map(h => h.value.toFixed(3));
+    miniData.datasets[0].data    = history.map(h => parseFloat(h.value.toFixed(3)));
     miniChart.update("none");
   }
 }
@@ -375,6 +430,18 @@ document.getElementById("resetTotalBtn").addEventListener("click", async () => {
   valveChart.update();
   document.querySelectorAll(".box.done").forEach(b => b.classList.remove("done"));
   toast("Total flow reset");
+});
+
+// Reset per-valve flow accumulators, caps, and limited valve markers
+document.getElementById("resetCapsBtn").addEventListener("click", async () => {
+  await window.api.resetCaps();
+  valveCumulativeFlow.fill(0);
+  valveChartData.datasets[0].data  = [...valveCumulativeFlow];
+  valveChart.update();
+  document.querySelectorAll(".box.done").forEach(b => b.classList.remove("done"));
+  const capInput = document.getElementById("flowCapInput");
+  if (capInput) capInput.value = "";
+  toast("Valve caps reset");
 });
 // The generate CSV button invokes the backend CSV generation method and shows a toast with the result path or error message.
 document.getElementById("csvBtn").addEventListener("click", async () => {

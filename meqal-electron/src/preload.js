@@ -42,6 +42,9 @@ contextBridge.exposeInMainWorld("api", {
   // Reset the total flow counter, flow history, per-valve accumulators, and the limited valve set
   resetTotal: () => ipcRenderer.invoke("api:reset_total"),
 
+  // Reset per-valve flow accumulators, caps, and limited valve set to allow all valves to freely flow again
+  resetCaps: () => ipcRenderer.invoke("api:reset_caps"),
+
   // Export the current flow history to a timestamped CSV file on the user's desktop
   generateCsv: () => ipcRenderer.invoke("api:csv"),
 
