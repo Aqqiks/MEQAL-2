@@ -34,12 +34,15 @@ const canDot      = document.getElementById("canDot");
 // Clicking a box updates the local activeValves Set and syncs the change to the main process via IPC.
 const valveGrid = document.getElementById("valveGrid");
 
+// We create 49 boxes for the valves, assigning them IDs from valve-1 to valve-49. Each box has an onclick handler that toggles its active state, 
+// -> updates the local activeValves set, and calls syncValves to send the updated selection to the backend.
 for (let i = 1; i <= VALVE_COUNT; i++) {
   const box = document.createElement("div");
   box.className = "box";
   box.id        = `valve-${i}`;
   box.innerText = i;
-
+  // The onclick handler toggles the valve's active state in the local activeValves set, updates the box's visual state, and 
+  // -> calls syncValves to send the new selection to the main process via IPC.
   box.onclick = () => {
     if (activeValves.has(i)) {
       activeValves.delete(i);
@@ -51,7 +54,7 @@ for (let i = 1; i <= VALVE_COUNT; i++) {
     }
     syncValves();
   };
-
+  // Each box is appended to the valveGrid container, which uses CSS grid layout to arrange them in a 7×7 format.
   valveGrid.appendChild(box);
 }
 
@@ -62,8 +65,11 @@ for (let i = 1; i <= VALVE_COUNT; i++) {
 const valveLabels         = Array.from({ length: VALVE_COUNT }, (_, i) => `V${i + 1}`);
 const valveCumulativeFlow = new Array(VALVE_COUNT).fill(0);
 
+// The valveChart is a bar chart that shows the cumulative flow for each valve. It is updated on every state tick while the system is running, 
+// accumulating flow based on which valves are active. The chart uses a green color scheme and has customized axes and tooltips for clarity.
 const valveChartCtx = document.getElementById("valveChartCanvas").getContext("2d");
 
+// The valveChartData object holds the labels (valve numbers) and dataset (cumulative flow values) for the per-valve bar chart.
 const valveChartData = {
   labels: valveLabels,
   datasets: [{
@@ -75,6 +81,8 @@ const valveChartData = {
   }]
 };
 
+// The valveChart is a bar chart that shows the cumulative flow for each valve. It is updated on every state tick while the system is running, 
+// accumulating flow based on which valves are active.
 const valveChart = new Chart(valveChartCtx, {
   type: "bar",
   data: valveChartData,
@@ -118,6 +126,8 @@ const valveChart = new Chart(valveChartCtx, {
 // A live line chart showing the instantaneous flow rate (L/s) over time, derived from the flow_history array sent by the main process.
 const chartCtx = document.getElementById("chartCanvas").getContext("2d");
 
+// The chartData object holds the labels (timestamps) and dataset (flow rates) for the main flow chart. It is updated on every state tick with the latest 
+// -> flow_history data from the backend, showing the real-time flow dynamics of the system.
 const chartData = {
   labels: [],
   datasets: [{
@@ -132,6 +142,8 @@ const chartData = {
   }]
 };
 
+// The mainChart is a line chart that plots the flow rate over time. It is updated on every state tick with the latest flow_history data from the backend, 
+// showing the real-time flow dynamics of the system.
 const mainChart = new Chart(chartCtx, {
   type: "line",
   data: chartData,
@@ -170,6 +182,7 @@ const mainChart = new Chart(chartCtx, {
 // Uses blue colouring to visually distinguish it from the main flow rate chart.
 const miniCtx = document.getElementById("totalChartCanvas").getContext("2d");
 
+// The miniData object holds the labels and dataset for the mini chart. It is updated with the same flow_history data as the main chart, but plots the total cumulative flow instead of the instantaneous rate.
 const miniData = {
   labels: [],
   datasets: [{
@@ -183,6 +196,7 @@ const miniData = {
   }]
 };
 
+// The mini chart is a simplified line chart without axes or tooltips, designed to show the overall trend of total flow over time in a compact form.
 const miniChart = new Chart(miniCtx, {
   type: "line",
   data: miniData,
@@ -209,6 +223,10 @@ const miniChart = new Chart(miniCtx, {
 // Updates all display elements: totals, flow rate, running status, CAN badge, valve grid, and charts.
 let lastFlowTotal = 0;
 
+// The updateUi function takes the latest system state object and updates all relevant UI elements accordingly. 
+// It handles the total flow display, active valve count, instantaneous flow rate, running status indicator, CAN connection badge, valve grid states, 
+// -> cumulative flow bar chart, and the main flow rate and mini total history charts. This function is called both on initial load with 
+// -> the fetched state and on every live state update pushed from the main process.
 function updateUi(state) {
 
   const total    = state.flow_total || 0;
@@ -269,13 +287,13 @@ function updateUi(state) {
   // Rebuild the main flow rate chart and mini history sparkline from the latest flow_history array
   if (state.flow_history && state.flow_history.length > 0) {
     const history = state.flow_history;
-
+    // The main chart plots the instantaneous flow rate over time, calculated as the difference between consecutive total flow values in the history (multiplied by 2 to convert from 0.5s ticks to L/s).
     chartData.labels           = history.map(h => new Date(h.time).toLocaleTimeString());
     chartData.datasets[0].data = history.map((h, i) =>
       i === 0 ? 0 : parseFloat(((h.value - history[i - 1].value) * 2).toFixed(4))
     );
     mainChart.update("none");
-
+    // The mini chart plots the cumulative total flow over time, using the same history data but showing the total value instead of the rate.
     miniData.labels              = chartData.labels;
     miniData.datasets[0].data    = history.map(h => h.value.toFixed(3));
     miniChart.update("none");
@@ -333,6 +351,7 @@ document.getElementById("emergencyBtn").addEventListener("click", async () => {
   toast("⚠ EMERGENCY STOP triggered", true);
 });
 
+// The reset valves button clears the local activeValves set, updates the grid display to show all valves as offline, and sends an empty selection to the backend.
 document.getElementById("resetValvesBtn").addEventListener("click", async () => {
   activeValves.clear();
   document.querySelectorAll(".box").forEach(b => b.classList.remove("online", "offline", "done"));
@@ -357,7 +376,7 @@ document.getElementById("resetTotalBtn").addEventListener("click", async () => {
   document.querySelectorAll(".box.done").forEach(b => b.classList.remove("done"));
   toast("Total flow reset");
 });
-
+// The generate CSV button invokes the backend CSV generation method and shows a toast with the result path or error message.
 document.getElementById("csvBtn").addEventListener("click", async () => {
   const result = await window.api.generateCsv();
   if (result.status === "ok") {
@@ -378,6 +397,7 @@ document.getElementById("selectAllBtn").addEventListener("click", async () => {
     b.classList.add("online");
     b.classList.remove("offline");
   });
+  // After updating the local activeValves set and refreshing the grid display, we call syncValves to send the new selection to the main process via IPC.
   await syncValves();
   toast("All 49 valves selected");
 });
@@ -387,7 +407,7 @@ document.getElementById("selectAllBtn").addEventListener("click", async () => {
 document.getElementById("areaSelect").onchange = async (e) => {
   const val = e.target.value;
   if (!val) return;
-
+  // Clear the current selection before applying the new one
   activeValves.clear();
 
   // Calculate which valve IDs belong to the selected row or column and add them to the active set
@@ -407,7 +427,7 @@ document.getElementById("areaSelect").onchange = async (e) => {
     b.classList.toggle("online", activeValves.has(i + 1));
     b.classList.remove("offline");
   });
-
+  // After updating the local activeValves set and refreshing the grid display, we call syncValves to send the new selection to the main process via IPC.
   await syncValves();
 };
 
@@ -431,6 +451,7 @@ const randomBtn     = document.getElementById("randomBtn");
 const randomCapsBtn = document.getElementById("randomCapsBtn");
 let randomCapsMode  = false;
 
+// The random mode button toggles the randomMode flag, updates the button's visual state, sends the new mode to the backend, and shows a toast confirmation.
 randomBtn.addEventListener("click", async () => {
   randomMode = !randomMode;
   randomBtn.classList.toggle("btn-random-on", randomMode);
@@ -438,6 +459,7 @@ randomBtn.addEventListener("click", async () => {
   toast(randomMode ? "Random mode ON — valves cycle independently" : "Random mode OFF");
 });
 
+// The random caps button toggles the randomCapsMode flag, updates the button's visual state, sends the new mode to the backend, and shows a toast confirmation.
 randomCapsBtn.addEventListener("click", async () => {
   const result   = await window.api.setRandomCaps();
   randomCapsMode = !!result.random_caps;
@@ -490,7 +512,7 @@ async function loadInitialState() {
     randomCapsMode = true;
     randomCapsBtn.classList.add("btn-random-on");
   }
-
+  // Finally, call updateUi with the loaded state to sync all displays, charts, and indicators with the backend's current status.
   updateUi(state);
 }
 // On initial load, we fetch the current state from the main process and call updateUi to sync the entire UI with the backend.
@@ -503,12 +525,14 @@ loadInitialState();
 // Any active toast is dismissed before showing a new one to avoid stacking.
 let toastTimer = null;
 
+// Displays a toast message with optional error styling. The toast automatically disappears after 3 seconds, 
+// -> and any existing toast is cleared before showing a new one.
 function toast(msg, isError = false) {
   const el             = document.getElementById("toast");
   el.textContent       = msg;
   el.style.borderColor = isError ? "var(--red)" : "var(--border-hi)";
   el.classList.add("show");
-
+  // Clear any existing toast timer to prevent multiple toasts from stacking; start a new timer to hide the toast after 3 seconds.
   clearTimeout(toastTimer);
   toastTimer = setTimeout(() => el.classList.remove("show"), 3000);
 }
