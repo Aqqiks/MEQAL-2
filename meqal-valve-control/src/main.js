@@ -21,6 +21,7 @@
 // ============================================================================
 
 const { app, BrowserWindow, ipcMain } = require("electron");
+const { spawn } = require("child_process");
 const path = require("path");
 const fs   = require("fs");
 
@@ -80,6 +81,16 @@ const NMT_START_ALL    = Buffer.from([0x01, 0x00, 0x27, 0xF0, 0x00, 0x00, 0x00, 
 const TX_DRAIN_MS      = 4;                    // pop one CAN frame every 4 ms (mcp251x-safe)
 const REFRESH_SWEEP_MS = 100;                  // re-assert every controller this often
 
+// "random" mode is driven by the external Python script, which decides the
+// open/closed valve set from the per-valve CSV timing profile and prints it on
+// stdout. main.js spawns it, reads that set, and drives the CAN bus + MQTT from
+// it (the script no longer talks to CAN/MQTT itself). It is a single ~5s run
+// (its own RUN_DURATION): one run per Random activation, then main.js goes idle.
+// Stop / Emergency / toggling the mode off kill it early.
+const PY_SCRIPT_DIR    = path.join(__dirname, "..", "scripts");
+const PY_SCRIPT        = path.join(PY_SCRIPT_DIR, "venttiiliohjaus.py");
+const PY_MIN_RUN_MS    = 1000;                 // a faster exit than this = launch failure (just warn)
+
 // ----------------------------------------------------------------------------
 // STATE — the one authoritative object
 // ----------------------------------------------------------------------------
@@ -94,7 +105,6 @@ const STATE = {
   duration:       null,                             // auto-stop ms; null = run until stop
   valveFlowLimit: null,                             // cumulative cap (L) per valve; null = off
   limitedValves:  new Set(),                        // valves permanently closed by the cap
-  randomStates:   {},                               // { id: { open, nextToggle } }
   naturalStates:  {},                               // { id: { open, burstCap, burstFlow, nextSwitch } }
 };
 
@@ -111,6 +121,8 @@ let mqttClient            = null;
 let canBus                = null;
 let canSimulated          = true;
 let canTxQueue            = [];      // [{ id, data }] paced out one-per-tick
+let pythonProc            = null;    // running venttiiliohjaus.py child, or null
+let pythonOpenSet         = new Set(); // open valve ids (1-indexed) the script last reported
 
 // ============================================================================
 // MQTT (optional)
@@ -275,9 +287,101 @@ function openValveSet() {
     return new Set(STATE.active_ids.filter(id => STATE.naturalStates[id]?.open));
   }
   if (STATE.mode === "random") {
-    return new Set(STATE.active_ids.filter(id => STATE.randomStates[id]?.open));
+    // Driven by venttiiliohjaus.py: open whatever the script reports, gated by
+    // the user's current selection so random still honours the chosen valves.
+    return new Set(STATE.active_ids.filter(id => pythonOpenSet.has(id)));
   }
   return new Set(STATE.active_ids); // continuous
+}
+
+// ============================================================================
+// RANDOM-MODE PYTHON DRIVER
+// ----------------------------------------------------------------------------
+// In "random" mode the open/closed timing comes from venttiiliohjaus.py (driven
+// by venttiilit.csv), NOT from an in-process JS toggle loop. We spawn it, read
+// "OPEN:<ids>" lines into pythonOpenSet, and the control loop turns that into
+// CAN frames + MQTT + flow exactly like any other mode. CAN/MQTT stay owned here.
+// ============================================================================
+
+// Ensure the Python driver is running iff we are actively running in random mode.
+function applyRandomDriver() {
+  if (STATE.running && STATE.mode === "random") startPythonRandom();
+  else stopPythonRandom();
+}
+
+function handlePyLine(line) {
+  if (!line) return;
+  if (line.startsWith("OPEN:")) {
+    const rest = line.slice(5).trim();
+    pythonOpenSet = rest
+      ? new Set(rest.split(",").map(Number).filter(n => n >= 1 && n <= VALVE_COUNT))
+      : new Set();
+  } else {
+    console.log("[PY]", line); // ACTIVE VALVES / [INFO] / [EMERGENCY] / DONE
+  }
+}
+
+function startPythonRandom() {
+  if (pythonProc) return; // already running
+  let proc;
+  try {
+    // -u = unbuffered stdout so we get each OPEN line immediately. cwd is the
+    // scripts dir so the script's relative "venttiilit.csv" path resolves.
+    proc = spawn("python3", ["-u", PY_SCRIPT], { cwd: PY_SCRIPT_DIR });
+  } catch (e) {
+    console.warn("[PY] spawn failed:", e.message);
+    pythonProc = null;
+    return;
+  }
+  pythonProc = proc;
+  const startedAt = Date.now();
+
+  let buf = "";
+  proc.stdout.on("data", (chunk) => {
+    buf += chunk.toString();
+    let nl;
+    while ((nl = buf.indexOf("\n")) >= 0) {
+      handlePyLine(buf.slice(0, nl).trim());
+      buf = buf.slice(nl + 1);
+    }
+  });
+  proc.stderr.on("data", (d) => console.warn("[PY:err]", d.toString().trim()));
+  proc.on("error", (e) => {
+    console.warn("[PY] process error:", e.message); // e.g. python3 not found
+    if (pythonProc === proc) pythonProc = null;
+    pythonOpenSet = new Set();
+  });
+  proc.on("close", (code) => {
+    if (pythonProc === proc) pythonProc = null;
+    pythonOpenSet = new Set();
+    const ranMs = Date.now() - startedAt;
+    // One run per Random press: if the script finished on its own while still
+    // the active running mode, the run is complete -> go idle. (We do NOT relaunch.)
+    // If it exited almost instantly it failed to launch — same outcome (idle),
+    // but warn so the cause is visible.
+    if (STATE.running && STATE.mode === "random") {
+      if (ranMs < PY_MIN_RUN_MS) {
+        console.warn(`[PY] exited in ${ranMs}ms (code ${code}) — launch likely failed; check python3 + scripts/venttiilit.csv`);
+      } else {
+        console.log("[PY] venttiiliohjaus.py run complete — going idle");
+      }
+      doStop();              // single run finished -> system idle, valves closed
+      pushStateToRenderer();
+    } else {
+      console.log("[PY] venttiiliohjaus.py stopped");
+    }
+  });
+  console.log("[PY] venttiiliohjaus.py started");
+}
+
+function stopPythonRandom() {
+  pythonOpenSet = new Set();
+  if (pythonProc) {
+    // SIGTERM -> the script's emergency_handler flips running=False and exits
+    // cleanly. running/mode are already cleared, so its close handler won't
+    // respawn it.
+    try { pythonProc.kill("SIGTERM"); } catch (_) {}
+  }
 }
 
 function randomInterval() {
@@ -287,27 +391,6 @@ function randomInterval() {
 // Random 2-5 dL burst expressed in litres.
 function randomBurstLitres() {
   return (NATURAL_MIN_DL + Math.random() * (NATURAL_MAX_DL - NATURAL_MIN_DL)) / 10;
-}
-
-function initRandomStates() {
-  const now = Date.now();
-  STATE.randomStates = {};
-  STATE.active_ids.forEach(id => {
-    STATE.randomStates[id] = { open: false, nextToggle: now + randomInterval() };
-  });
-}
-
-function tickRandomStates(now) {
-  STATE.active_ids.forEach(id => {
-    let s = STATE.randomStates[id];
-    if (!s) { s = STATE.randomStates[id] = { open: false, nextToggle: now + randomInterval() }; }
-    if (now >= s.nextToggle) {
-      s.open = !s.open;
-      // Honour the hardware-safe minimum open time before allowing a close.
-      const interval = s.open ? Math.max(MIN_OPEN_MS, randomInterval()) : randomInterval();
-      s.nextToggle = now + interval;
-    }
-  });
 }
 
 // Natural mode: each valve starts open with a fresh 2-5 dL burst target. It
@@ -339,7 +422,8 @@ function controlLoopTick() {
   const newStates = new Array(VALVE_COUNT + 1).fill(false);
   const flowInc   = new Array(VALVE_COUNT + 1).fill(0.0);
 
-  if (STATE.mode === "random")  tickRandomStates(now);
+  // random mode's open set comes from the Python driver (pythonOpenSet); no JS
+  // toggling here. natural still runs its in-process pulse state machine.
   if (STATE.mode === "natural") tickNaturalCloseReopen(now);
 
   const openSet = openValveSet();
@@ -425,7 +509,6 @@ function tickNaturalCloseReopen(now) {
 function retireValve(vid) {
   STATE.active_ids = STATE.active_ids.filter(id => id !== vid);
   STATE.limitedValves.add(vid);
-  delete STATE.randomStates[vid];
   delete STATE.naturalStates[vid];
 }
 
@@ -458,7 +541,6 @@ function snapshot(extra = {}) {
 // (Re)initialise per-mode bookkeeping for the current selection.
 function syncModeStates() {
   if (!STATE.running) return;
-  if (STATE.mode === "random")  initRandomStates();
   if (STATE.mode === "natural") initNaturalStates();
 }
 
@@ -477,6 +559,7 @@ ipcMain.handle("api:start", () => {
   }
   STATE.running = true;
   syncModeStates();
+  applyRandomDriver(); // spawn venttiiliohjaus.py if we're starting in random mode
 
   if (autoStopTimer) { clearTimeout(autoStopTimer); autoStopTimer = null; }
   if (STATE.duration) {
@@ -497,6 +580,7 @@ function doStop() {
   STATE.running      = false;
   STATE.valve_states = new Array(VALVE_COUNT + 1).fill(false);
   if (autoStopTimer) { clearTimeout(autoStopTimer); autoStopTimer = null; }
+  stopPythonRandom(); // running is now false, so its close handler won't respawn
   sendAllClosed();
 }
 
@@ -514,9 +598,9 @@ ipcMain.handle("api:emergency", () => {
   STATE.running       = false;
   STATE.active_ids    = [];
   STATE.valve_states  = new Array(VALVE_COUNT + 1).fill(false);
-  STATE.randomStates  = {};
   STATE.naturalStates = {};
   if (autoStopTimer) { clearTimeout(autoStopTimer); autoStopTimer = null; }
+  stopPythonRandom(); // kill the random driver before blasting closes
   sendAllClosed(5); // 5 paced close sweeps, mirroring the reference shutdown
   pushStateToRenderer({ emergency: true });
   console.warn("[SYSTEM] *** EMERGENCY STOP *** all valves forced closed");
@@ -551,6 +635,7 @@ ipcMain.handle("api:set_mode", (_event, { mode }) => {
   const valid = ["continuous", "random", "natural"];
   STATE.mode = valid.includes(mode) ? mode : "continuous";
   syncModeStates();
+  applyRandomDriver(); // launch the Python driver if we just entered random (and are running), else stop it
   console.log("[MODE]", STATE.mode);
   pushStateToRenderer();
   return { status: "ok", mode: STATE.mode };
@@ -659,6 +744,7 @@ function shutdown() {
   if (canTxTimer)          clearInterval(canTxTimer);
   if (autoStopTimer)       clearTimeout(autoStopTimer);
   if (connectionHealTimer) clearInterval(connectionHealTimer);
+  if (pythonProc) { try { pythonProc.kill("SIGTERM"); } catch (_) {} pythonProc = null; }
   // The paced drain is stopping with us, so send the closing frames directly
   // and synchronously here to guarantee every valve is shut on the way out.
   if (canBus) {

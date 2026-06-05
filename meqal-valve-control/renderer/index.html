@@ -103,6 +103,7 @@
   .btn-danger:hover { background: var(--red); }
   .btn-random-on { background: rgba(59,130,246,0.15); border-color: var(--blue); color: var(--blue); }
   .btn-normal-on { background: var(--green-glow); border-color: var(--green); color: var(--green); }
+  .btn-selectall-on { background: var(--green-glow); border-color: var(--green); color: var(--green); }
   .toolbar-sep { width: 1px; height: 28px; background: var(--border); margin: 0 4px; }
   .row-select {
     padding: 7px 10px; border-radius: var(--radius);
@@ -229,7 +230,7 @@
       <option value="col-7">Col 7  (7,14,21,28,35,42,49)</option>
     </optgroup>
   </select>
-  <button class="btn" id="selectAllBtn">&#8862; All</button>
+  <button class="btn" id="selectAllBtn" title="Toggle switch: press once to select all 49 valves, press again to clear the selection">&#8862; All</button>
   <div class="toolbar-sep"></div>
 
   <select class="row-select" id="timeSelect">
@@ -243,9 +244,9 @@
     <option value="600000">10 min</option>
   </select>
 
-  <button class="btn" id="normalBtn" title="Normal mode: open all valves and release gas continuously until the cap, Stop, or Emergency Stop">&#9608; Normal (all)</button>
-  <button class="btn" id="randomBtn" title="Selected valves toggle open/closed at random intervals">&#8652; Random</button>
-  <button class="btn" id="randomCapsBtn" title="Selected valves pulse: each open burst delivers a random 2–5 dL, then a random pause, repeating">&#9096; Natural (pulse)</button>
+  <button class="btn" id="normalBtn" title="Normal mode: the selected valves release gas continuously until the cap, Stop, or Emergency Stop">&#9608; Normal</button>
+  <button class="btn" id="randomBtn" title="Random mode: runs venttiiliohjaus.py, cycling the selected valves using the per-valve open/close timing in venttiilit.csv">&#8652; Natural (2-5dl)</button>
+  <button class="btn" id="randomCapsBtn" title="Selected valves pulse: each open burst delivers a random 2–5 dL, then a random pause, repeating">&#9096; Natural (unlimited)</button>
   <div class="toolbar-sep"></div>
 
   <span class="toolbar-label">Cap/valve</span>

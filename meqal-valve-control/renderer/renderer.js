@@ -33,6 +33,7 @@ const canDot      = $("canDot");
 const normalBtn   = $("normalBtn");
 const randomBtn   = $("randomBtn");
 const naturalBtn  = $("randomCapsBtn");
+const selectAllBtn = $("selectAllBtn");
 
 // ============================================================================
 // TOAST
@@ -75,6 +76,14 @@ for (let i = 1; i <= VALVE_COUNT; i++) {
 async function syncValves() {
   await window.api.setValves(Array.from(activeValves));
   activeCount.innerText = activeValves.size;
+  reflectSelectAll();
+}
+
+// Keep the Select-All toggle lit only while the whole grid is selected, so its
+// on/off state always matches reality (grid clicks, area select, reset, etc.).
+function reflectSelectAll() {
+  if (!selectAllBtn) return;
+  selectAllBtn.classList.toggle("btn-selectall-on", activeValves.size === VALVE_COUNT);
 }
 
 // ============================================================================
@@ -106,14 +115,25 @@ $("emergencyBtn").addEventListener("click", async () => {
   toast("\u26A0 EMERGENCY STOP — all valves closed", true);
 });
 
-$("selectAllBtn").addEventListener("click", async () => {
-  activeValves = new Set(Array.from({ length: VALVE_COUNT }, (_, i) => i + 1));
-  document.querySelectorAll(".box").forEach(b => {
-    b.classList.remove("offline", "done");
-    b.classList.add("online");
-  });
-  await syncValves();
-  toast("All 49 valves selected");
+// Select-All toggle (on/off switch). First press selects all 49 valves; press
+// again to clear the whole selection. The button stays lit while everything is
+// selected. Every mode — normal, random, natural — runs on whatever is selected
+// here, so this is how the user flips the entire grid on or off in one click.
+selectAllBtn.addEventListener("click", async () => {
+  if (activeValves.size === VALVE_COUNT) {
+    activeValves.clear();
+    document.querySelectorAll(".box").forEach(b => b.classList.remove("online", "offline", "done"));
+    await syncValves();
+    toast("All valves deselected");
+  } else {
+    activeValves = new Set(Array.from({ length: VALVE_COUNT }, (_, i) => i + 1));
+    document.querySelectorAll(".box").forEach(b => {
+      b.classList.remove("offline", "done");
+      b.classList.add("online");
+    });
+    await syncValves();
+    toast("All 49 valves selected");
+  }
 });
 
 $("areaSelect").onchange = async (e) => {
@@ -156,26 +176,27 @@ function reflectMode() {
   naturalBtn.classList.toggle("btn-random-on", currentMode === "natural");
 }
 
-// Normal: select every valve and run continuously. Opens all valves and keeps
-// releasing gas until the per-valve cap, Stop, or Emergency Stop.
+// Normal (continuous): the selected valves stay open and keep releasing gas
+// until the per-valve cap, Stop, or Emergency Stop. It runs on the CURRENT
+// selection \u2014 pick valves on the grid, or press "All" to flow every valve.
 normalBtn.addEventListener("click", async () => {
-  activeValves = new Set(Array.from({ length: VALVE_COUNT }, (_, i) => i + 1));
-  document.querySelectorAll(".box").forEach(b => {
-    b.classList.remove("offline", "done");
-    b.classList.add("online");
-  });
-  await syncValves();
   await setMode("continuous");
-  toast("Normal mode \u2014 all 49 valves open, flowing until cap/stop");
+  toast(activeValves.size
+    ? `Normal mode \u2014 ${activeValves.size} selected valve(s) flow until cap/stop`
+    : "Normal mode \u2014 select valves (or press All), then Start");
 });
 
 // Random / Natural toggle: pressing the active one drops back to continuous.
 randomBtn.addEventListener("click", async () => {
   const next = currentMode === "random" ? "continuous" : "random";
   await setMode(next);
-  toast(next === "random"
-    ? "Random mode \u2014 valves cycle at random intervals"
-    : "Continuous mode \u2014 selected valves stay open");
+  if (next !== "random") {
+    toast("Continuous mode \u2014 selected valves stay open");
+  } else {
+    toast(isRunning
+      ? "Random \u2014 running venttiiliohjaus.py once (~5s, CSV-timed)"
+      : "Random selected \u2014 press Start to run venttiiliohjaus.py once (~5s)");
+  }
 });
 naturalBtn.addEventListener("click", async () => {
   const next = currentMode === "natural" ? "continuous" : "natural";
@@ -374,6 +395,7 @@ function updateUi(state) {
     box.classList.toggle("done", isLimited && !isSelected && !isOpen);
     box.classList.remove("offline");
   }
+  reflectSelectAll();
 
   // Per-valve bar chart straight from the backend accumulators (no drift).
   if (state.valve_flow_accum) {
