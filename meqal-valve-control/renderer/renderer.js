@@ -13,13 +13,11 @@
 
 const GRID_SIZE        = 7;
 const VALVE_COUNT      = 49;
-const DOUBLE_PRESS_MS  = 600;   // second Start press within this window => stop
 
 // --- Local UI state ----------------------------------------------------------
 let activeValves   = new Set();
 let isRunning      = false;
 let currentMode    = "continuous";   // "continuous" | "random" | "natural"
-let lastStartClick = 0;
 
 // --- Element handles ----------------------------------------------------------
 const $ = (id) => document.getElementById(id);
@@ -32,6 +30,7 @@ const sbStatus    = $("sbStatus");
 const sbTime      = $("sbTime");
 const canStatus   = $("canStatus");
 const canDot      = $("canDot");
+const normalBtn   = $("normalBtn");
 const randomBtn   = $("randomBtn");
 const naturalBtn  = $("randomCapsBtn");
 
@@ -82,18 +81,12 @@ async function syncValves() {
 // CONTROL WIRING  (done first, so the panel is never dead)
 // ============================================================================
 
-// Start: a second press within DOUBLE_PRESS_MS stops the system.
+// Start: opens the selected valves (or all 49 if none are selected) and runs
+// in the current mode until the cap, Stop, or Emergency Stop. Start and Stop
+// are distinct buttons — no fragile double-press gesture.
 $("startBtn").addEventListener("click", async () => {
-  const now = Date.now();
-  if (isRunning && (now - lastStartClick) < DOUBLE_PRESS_MS) {
-    lastStartClick = 0;
-    await window.api.stop();
-    toast("Double-press detected — system stopped");
-    return;
-  }
-  lastStartClick = now;
   await window.api.start();
-  toast(isRunning ? "Already running — press again to stop" : "System started");
+  toast(isRunning ? "Already running" : "System started");
 });
 
 $("stopBtn").addEventListener("click", async () => {
@@ -150,23 +143,47 @@ $("timeSelect").addEventListener("change", async (e) => {
   toast(ms ? `Timer: ${e.target.options[e.target.selectedIndex].text}` : "Timer off — runs until stop");
 });
 
-// Mode toggles. Random and Natural are mutually exclusive; pressing the active
-// one returns to continuous.
-async function applyMode(mode) {
-  currentMode = (currentMode === mode) ? "continuous" : mode;
-  const res = await window.api.setMode(currentMode);
-  currentMode = res.mode || currentMode;
+// Mode selection. The three modes are mutually exclusive. Pressing the active
+// Random/Natural button returns to continuous (normal).
+async function setMode(mode) {
+  const res = await window.api.setMode(mode);
+  currentMode = res.mode || mode;
   reflectMode();
-  if (currentMode === "random")  toast("Random mode — valves cycle at random intervals");
-  else if (currentMode === "natural") toast("Natural mode — valves pulse with 2\u20135 dL bursts");
-  else toast("Continuous mode — selected valves stay open");
 }
 function reflectMode() {
+  normalBtn.classList.toggle("btn-normal-on",  currentMode === "continuous");
   randomBtn.classList.toggle("btn-random-on",  currentMode === "random");
   naturalBtn.classList.toggle("btn-random-on", currentMode === "natural");
 }
-randomBtn.addEventListener("click",  () => applyMode("random"));
-naturalBtn.addEventListener("click", () => applyMode("natural"));
+
+// Normal: select every valve and run continuously. Opens all valves and keeps
+// releasing gas until the per-valve cap, Stop, or Emergency Stop.
+normalBtn.addEventListener("click", async () => {
+  activeValves = new Set(Array.from({ length: VALVE_COUNT }, (_, i) => i + 1));
+  document.querySelectorAll(".box").forEach(b => {
+    b.classList.remove("offline", "done");
+    b.classList.add("online");
+  });
+  await syncValves();
+  await setMode("continuous");
+  toast("Normal mode \u2014 all 49 valves open, flowing until cap/stop");
+});
+
+// Random / Natural toggle: pressing the active one drops back to continuous.
+randomBtn.addEventListener("click", async () => {
+  const next = currentMode === "random" ? "continuous" : "random";
+  await setMode(next);
+  toast(next === "random"
+    ? "Random mode \u2014 valves cycle at random intervals"
+    : "Continuous mode \u2014 selected valves stay open");
+});
+naturalBtn.addEventListener("click", async () => {
+  const next = currentMode === "natural" ? "continuous" : "natural";
+  await setMode(next);
+  toast(next === "natural"
+    ? "Natural mode \u2014 each valve pulses its own random 2\u20135 dL bursts"
+    : "Continuous mode \u2014 selected valves stay open");
+});
 
 // Cumulative per-valve cap, typed in decilitres, sent as litres.
 $("flowCapInput").addEventListener("change", async (e) => {
