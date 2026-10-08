@@ -5,9 +5,9 @@ Type=Application
 Name=MEQAL Dev
 Comment=MEQAL Valve Control System
 
-Exec=/home/meqal/MEQAL-2/meqal-valve-control/scripts/launch.sh
+Exec=/home/meqal/final_meqal_dash/MEQAL-2/meqal-valve-control/scripts/launch.sh
 
-Path=/home/meqal/MEQAL-2/meqal-valve-control
+Path=/home/meqal/final_meqal_dash/MEQAL-2/meqal-valve-control/scripts/
 
 Icon=/usr/share/icons/MEQAL.png
 
