@@ -4,16 +4,21 @@
   "description": "MEQAL Valve Control System - Electron App",
   "main": "src/main.js",
   "scripts": {
-    "start": "electron .",
-    "postinstall": "electron-rebuild -f -w socketcan",
+    "start": "ELECTRON_OZONE_PLATFORM_HINT=auto electron .",
+    "dev": "ELECTRON_OZONE_PLATFORM_HINT=auto electron . --dev",
     "rebuild:socketcan": "electron-rebuild -f -w socketcan",
-    "build": "electron-builder --linux --win --mac",
+    "build": "electron-builder --linux --win",
     "build:linux": "electron-builder --linux",
     "build:win": "electron-builder --win"
   },
   "build": {
     "appId": "com.meqal.valve-control",
     "productName": "MEQAL Valve Control",
+    "files": [
+      "src/**/*",
+      "renderer/**/*",
+      "assets/**/*"
+    ],
     "directories": {
       "output": "dist"
     },
@@ -30,9 +35,8 @@
     "electron": "^28.3.3",
     "electron-builder": "^24.13.3"
   },
-  "dependencies": {
+  "optionalDependencies": {
     "mqtt": "^4.3.7",
-    "net-socket": "^1.1.0",
     "socketcan": "^4.0.7"
   }
 }

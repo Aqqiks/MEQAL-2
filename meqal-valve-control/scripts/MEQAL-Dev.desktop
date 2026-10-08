@@ -1,0 +1,17 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+
+Name=MEQAL Dev
+Comment=MEQAL Valve Control System
+
+Exec=/home/meqal/final_meqal_dash/MEQAL-2/meqal-valve-control/scripts/launch.sh
+
+Path=/home/meqal/final_meqal_dash/MEQAL-2/meqal-valve-control/scripts/
+
+Icon=/usr/share/icons/MEQAL.png
+
+Terminal=false
+
+Categories=Development;
+StartupNotify=true
