@@ -4,6 +4,17 @@ Electron desktop app controlling a 7×7 (49-valve) gas manifold over CANopen,
 with optional MQTT mirroring. Runs fully even without CAN hardware
 (simulation mode), so you can develop and demo on any OS.
 
+## Install (prebuilt AppImage)
+
+Download `MEQAL-Valve-Control-1.0.0-arm64.AppImage` from the
+[Releases page](https://github.com/Aqqiks/MEQAL-2/releases) (arm64 / Raspberry
+Pi only), then make it executable and run it:
+
+```bash
+chmod +x MEQAL-Valve-Control-1.0.0-arm64.AppImage
+./MEQAL-Valve-Control-1.0.0-arm64.AppImage
+```
+
 ## Run
 
 The simplest way on the Raspberry Pi is the **desktop launcher**
