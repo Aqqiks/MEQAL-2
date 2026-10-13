@@ -42,5 +42,14 @@ LOG="${HOME}/.meqal-valve.log"
   echo "[launch] starting: $ELECTRON $DIR"
 } >>"$LOG" 2>&1
 
+# Nothing to start: say so on screen. From the desktop icon there is no
+# terminal, and a launcher that silently does nothing costs an afternoon.
+if [ ! -x "$ELECTRON" ]; then
+  MSG="MEQAL is not installed in $DIR (no node_modules). Open a terminal there and run:  npm run setup"
+  echo "[launch] $MSG" >>"$LOG"
+  command -v zenity >/dev/null 2>&1 && zenity --error --title="MEQAL Valve Control" --width=460 --text="$MSG" 2>/dev/null
+  exit 1
+fi
+
 cd "$DIR" || exit 1
 exec "$ELECTRON" "$DIR" "$@" >>"$LOG" 2>&1

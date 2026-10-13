@@ -1,8 +1,24 @@
 # MEQAL Valve Control
 
 Electron desktop app controlling a 7×7 (49-valve) gas manifold over CANopen,
-with optional MQTT mirroring. Runs fully even without CAN hardware
-(simulation mode), so you can develop and demo on any OS.
+publishing valve state and flow over MQTT. It expects the real hardware and
+says so when something is missing; simulation exists only on request
+(`npm run sim`).
+
+The full guide (daily use, how it works, installing, maintaining,
+troubleshooting) is here:
+https://claude.ai/code/artifact/ff73e86c-570a-4615-a176-f97e755e19bd
+
+## Set up a fresh checkout
+
+```bash
+npm run setup
+```
+
+Installs the packages, proves that `socketcan` and `mqtt` really load inside
+the app's Electron (restoring the prebuilt copies in `vendor/` when a download
+or a build failed), and points the desktop icon at this folder. `npm run
+doctor` runs the same check without changing anything.
 
 ## Install (prebuilt AppImage)
 
@@ -14,6 +30,10 @@ Pi only), then make it executable and run it:
 chmod +x MEQAL-Valve-Control-1.0.0-arm64.AppImage
 ./MEQAL-Valve-Control-1.0.0-arm64.AppImage
 ```
+
+The AppImage does not bring the CAN bus up: run `scripts/can-up.sh` first.
+Check the release date against the code; build a current one with
+`npm run build:linux`.
 
 ## Run
 
@@ -27,16 +47,20 @@ The simplest way on the Raspberry Pi is the **desktop launcher**
 To run by hand:
 
 ```bash
-npm install          # installs electron + electron-builder (native CAN/MQTT are optional)
+npm run setup            # once per checkout (see above)
 bash scripts/launch.sh   # CAN bring-up + app, exactly like the desktop icon
-# or, without touching CAN:
-npm start            # launch the app
-npm run dev          # launch with DevTools open
+# or, with the CAN bus already up:
+npm start                # launch the app
+npm run dev              # launch with DevTools open
+npm run sim              # no hardware at all: nothing reaches a valve
 ```
 
-`npm install` never fails on missing native build tools: `socketcan` and `mqtt`
-are **optional**. Without them the app runs in CAN **simulation** mode (status
-bar shows `CAN SIM`).
+`socketcan` and `mqtt` are listed as optional so that the project still
+installs on a non-Linux machine, but the dashboard cannot work without them.
+A plain `npm install` builds `socketcan` for the system's Node.js, which the
+app's Electron cannot load; the check that runs after every install fixes that
+from `vendor/`. If the CAN driver is still missing the app shows
+`CAN DRIVER MISSING` and refuses to start a run.
 
 ### CAN bring-up (Linux only)
 
@@ -47,7 +71,6 @@ sudo ip link set can0 down                              # required: can't re-bit
 sudo ip link set can0 type can bitrate 125000 restart-ms 100
 sudo ip link set can0 up
 cansend can0 000#010027F000000000                       # NMT: start all nodes
-npm run rebuild:socketcan                               # (once) build the native addon for Electron
 ```
 
 The bus runs at **125000 bit/s**. A wrong bitrate (e.g. 500000) drives the
@@ -68,6 +91,9 @@ opening" symptom. `restart-ms 100` lets the controller auto-recover from
 
 - **Start** — opens the selected valves (or **all 49** if none are selected)
   and runs in the current mode until the cap, **Stop**, or **Emergency Stop**.
+  Valves open a few at a time (all 49 take 2.5 s): switching them all on in
+  the same instant made the 12 V supply collapse. Start is refused, with the
+  reason, when there is no CAN link or right after a protective stop.
   Start and Stop are distinct buttons (no double-press gesture).
 - **Normal (all)** — selects every valve and runs continuous flow: opens all
   valves and keeps releasing gas until the per-valve cap, Stop, or Emergency.
@@ -141,7 +167,10 @@ So the app listens to the bus as well as talking to it:
   and its valves are drawn with a dashed red border: they are not under
   control, whatever was commanded.
 - A controller that restarts three times within 30 s during a run ends the
-  run. This usually means its supply voltage sags when the coils switch on.
+  run and blocks Start for 10 s. This means its supply voltage collapses under
+  the load; the log says how many valves were open when it went quiet.
+- Each controller's supply voltage is read every half second during a run and
+  shown in the status bar; a sag below 10.5 V is logged.
 - Fault messages from the controllers (EMCY) are decoded into the log.
 - A valve that a controller still drives 1.5 s after it was told to close is
   flagged as stuck.
@@ -165,5 +194,6 @@ npm test
 ```
 
 Runs the real `src/main.js` and `renderer/renderer.js` against a simulated CAN
-bus and five simulated controllers (`test/sim.js`). No hardware and no window
-are involved, and it takes a couple of seconds.
+bus, five simulated controllers, a simulated power supply and a simulated MQTT
+broker (`test/sim.js`). No hardware and no window are involved, and it takes a
+few seconds.

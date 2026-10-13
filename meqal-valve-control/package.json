@@ -6,7 +6,12 @@
   "scripts": {
     "start": "ELECTRON_OZONE_PLATFORM_HINT=auto electron .",
     "dev": "ELECTRON_OZONE_PLATFORM_HINT=auto electron . --dev",
+    "sim": "MEQAL_SIMULATE=1 ELECTRON_OZONE_PLATFORM_HINT=auto electron .",
     "test": "node --test test/*.test.js",
+    "setup": "bash scripts/setup.sh",
+    "doctor": "node scripts/ensure-deps.js --check",
+    "vendor": "node scripts/vendor-deps.js",
+    "postinstall": "node scripts/ensure-deps.js",
     "rebuild:socketcan": "electron-rebuild -f -w socketcan",
     "build": "electron-builder --linux --win",
     "build:linux": "electron-builder --linux",
@@ -29,7 +34,18 @@
     },
     "win": {
       "target": "nsis"
-    }
+    },
+    "extraResources": [
+      {
+        "from": "scripts",
+        "to": "scripts",
+        "filter": [
+          "venttiiliohjaus.py",
+          "venttiilit.csv",
+          "can-up.sh"
+        ]
+      }
+    ]
   },
   "devDependencies": {
     "@electron/rebuild": "^3.7.2",

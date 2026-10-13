@@ -132,6 +132,16 @@ class SimNode {
       return;
     }
 
+    // SDO read of object 5020h (measured supply voltage, float32). Answered in
+    // PRE-OPERATIONAL too, like the real units.
+    if (f.id === 0x600 + this.id && f.data.length >= 4 && f.data[0] === 0x40 && f.data[1] === 0x20 && f.data[2] === 0x50) {
+      const b = Buffer.from([0x43, 0x20, 0x50, 0x00, 0, 0, 0, 0]);
+      b.writeFloatLE(this.bus.supplyVolts(this), 4);
+      this.bus.sdoReads++;
+      this.bus.nodeTransmit(this, 0x580 + this.id, b);
+      return;
+    }
+
     if (this.state !== "operational") return;  // PDOs are only processed when OPERATIONAL
     if ((f.id & 0x7F) !== this.id) return;
     const base = f.id & 0x780;
@@ -139,11 +149,15 @@ class SimNode {
     if (first < 0) return;
     if (f.data.length < 8) return;             // shorter than the mapped length: discarded
     for (let k = 0; k < 4 && first + k < VALVES_PER_NODE; k++) {
-      this.pv[first + k] = f.data.readUInt16LE(k * 2);
+      const i = first + k;
+      const wasOn = this.fv(i) > 0;
+      this.pv[i] = f.data.readUInt16LE(k * 2);
+      if (!wasOn && this.fv(i) > 0) this.bus.switchedOn();
     }
     let driven = 0;
     for (let i = 0; i < VALVES_PER_NODE; i++) if (this.fv(i) > 0) driven++;
-    if (driven > this.maxOpen) this.reset();   // supply collapses under the load
+    if (driven > this.maxOpen) { this.reset(); return; } // this controller's own feed collapses
+    this.bus.powerCheck();
   }
 
   _setState(next) {
@@ -245,7 +259,38 @@ class SimBus {
     this.wire     = [];                        // frames that reached the wire: { t, id, data, src }
     this.stats    = { accepted: 0, enobufs: 0, enetdown: 0 };
     this._busy    = false;
+    // The shared 12 V supply. It collapses (the weak controllers lose power
+    // and restart) when more than `maxStep` valves switch on within
+    // `stepWindowMs`, or when more than `maxValves` are held open at once.
+    // The real rig did exactly this on 2026-10-08 with controllers 1, 3, 4.
+    this.psu = { volts: 12.1, sagPerValve: 0, maxStep: Infinity, stepWindowMs: 100, maxValves: Infinity,
+                 weak: [1, 3, 4], ...(opts.psu || {}) };
+    this.brownOuts  = 0;
+    this.sdoReads   = 0;
+    this.peakStep   = 0;                       // most valves ever switched on within one window
+    this._turnOns   = [];
   }
+
+  switchedOn() {
+    const now = this.clock.now;
+    this._turnOns = this._turnOns.filter(t => now - t < this.psu.stepWindowMs);
+    this._turnOns.push(now);
+    if (this._turnOns.length > this.peakStep) this.peakStep = this._turnOns.length;
+  }
+
+  powerCheck() {
+    const now = this.clock.now, p = this.psu;
+    this._turnOns = this._turnOns.filter(t => now - t < p.stepWindowMs);
+    if (this._turnOns.length <= p.maxStep && this.openValves().length <= p.maxValves) return;
+    this.brownOuts++;
+    this._turnOns = [];
+    for (const id of p.weak) {
+      const n = this.nodes.get(id);
+      if (n && n.state !== "off" && n.state !== "booting") n.reset();
+    }
+  }
+
+  supplyVolts() { return this.psu.volts - this.psu.sagPerValve * this.openValves().length; }
 
   addNode(id, opts) { const n = new SimNode(this, id, opts); this.nodes.set(id, n); return n; }
 
@@ -316,6 +361,55 @@ class SimBus {
   }
   framesFrom(src) { return this.wire.filter(f => f.src === src); }
   nmtStarts(sinceT = 0) { return this.wire.filter(f => f.id === 0 && f.data[0] === 0x01 && f.t >= sinceT).length; }
+}
+
+// ----------------------------------------------------------------------------
+// Simulated MQTT broker + the part of the mqtt library the app uses
+// ----------------------------------------------------------------------------
+class SimBroker {
+  constructor(clock, up = true) {
+    this.clock = clock;
+    this.up = up;
+    this.messages = [];                        // { t, topic, payload }
+    this.clients = new Set();
+  }
+  stop()  { this.up = false; for (const c of Array.from(this.clients)) c._drop(); }
+  start() { this.up = true; }
+  last(topic) {
+    for (let i = this.messages.length - 1; i >= 0; i--) if (this.messages[i].topic === topic) return this.messages[i].payload;
+    return null;
+  }
+  // Stands in for require("mqtt").
+  library() {
+    const broker = this;
+    return {
+      connect(_url, opts = {}) {
+        const h = {};
+        const client = {
+          connected: false,
+          on(evt, fn) { (h[evt] ||= []).push(fn); return client; },
+          publish(topic, payload) { if (client.connected) broker.messages.push({ t: broker.clock.now, topic, payload: String(payload) }); },
+          end() { client._ended = true; client.connected = false; broker.clients.delete(client); },
+          _emit(evt, ...a) { for (const fn of h[evt] || []) fn(...a); },
+          _try() {
+            if (client._ended) return;
+            if (broker.up) { client.connected = true; broker.clients.add(client); client._emit("connect"); return; }
+            client._emit("error", new Error("connect ECONNREFUSED 127.0.0.1:1883"));
+            client._emit("close");
+            if (opts.reconnectPeriod > 0) broker.clock.setTimeout(() => client._try(), opts.reconnectPeriod);
+          },
+          _drop() {
+            client.connected = false;
+            broker.clients.delete(client);
+            client._emit("close");
+            if (opts.reconnectPeriod > 0) broker.clock.setTimeout(() => client._try(), opts.reconnectPeriod);
+          },
+        };
+        broker.clock.setTimeout(() => client._try(), 5);
+        return client;
+      },
+    };
+  }
 }
 
 // ----------------------------------------------------------------------------
@@ -430,7 +524,10 @@ function loadApp(opts = {}) {
     },
   };
   const fakeRequire = (name) => {
-    if (name === "mqtt") throw new Error("Cannot find module 'mqtt'"); // optional dependency, absent
+    if (name === "mqtt") {
+      if (opts.mqttMissing || !opts.broker) throw new Error("Cannot find module 'mqtt'");
+      return opts.broker.library();
+    }
     if (name === "socketcan" && opts.socketcanMissing) throw new Error("Cannot find module 'socketcan'");
     if (name === "fs") return fakeFs;
     if (stubs[name]) return stubs[name];
@@ -497,12 +594,14 @@ function rig(opts = {}) {
   const late = new Set(opts.lateNodes || []);      // not powered when the app starts
   for (const n of bus.nodes.values()) if (!late.has(n.id)) n.powerOn();
   clock.advance(1000);                             // booted -> PRE-OPERATIONAL
-  const app = loadApp({ clock, bus, ...(opts.app || {}) });
+  // A broker is running on the Pi unless the test says otherwise.
+  const broker = new SimBroker(clock, opts.brokerUp ?? true);
+  const app = loadApp({ clock, bus, broker, ...(opts.app || {}) });
   app.boot();
   clock.advance(opts.settleMs ?? 500);
-  return { clock, bus, app, node: (id) => bus.nodes.get(id) };
+  return { clock, bus, app, broker, node: (id) => bus.nodes.get(id) };
 }
 
 const range = (a, b) => Array.from({ length: b - a + 1 }, (_, i) => a + i);
 
-module.exports = { Clock, SimBus, SimNode, loadApp, rig, range, VALVE_COUNT };
+module.exports = { Clock, SimBus, SimNode, SimBroker, loadApp, rig, range, VALVE_COUNT };

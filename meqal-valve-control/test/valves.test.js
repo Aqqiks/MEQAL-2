@@ -15,6 +15,10 @@ const { rig, loadApp, range } = require("./sim");
 
 const ALL = range(1, 49);
 
+// Normal mode lets 2 valves join per 100 ms tick (soft start), so all 49 are
+// open 2.5 s after Start. RAMP is that plus a margin.
+const RAMP = 3500;
+
 // ----------------------------------------------------------------------------
 // Normal operation
 // ----------------------------------------------------------------------------
@@ -33,7 +37,7 @@ test("Start opens exactly the selected valves and Stop closes them", () => {
 test("Start with nothing selected opens all 49; Emergency Stop closes all and clears the selection", () => {
   const r = rig();
   r.app.invoke("api:start");
-  r.clock.advance(500);
+  r.clock.advance(RAMP);
   assert.deepEqual(r.bus.openValves(), ALL);
 
   r.app.invoke("api:emergency");
@@ -126,7 +130,7 @@ test("FAULT valves dead: a controller that powers up after the app is started au
 
   r.app.invoke("api:valves", { active_ids: ALL });
   r.app.invoke("api:start");
-  r.clock.advance(1000);
+  r.clock.advance(RAMP);
   assert.deepEqual(r.bus.openValves(), ALL);
 
   r.app.invoke("api:stop");
@@ -138,7 +142,7 @@ test("FAULT valves dead: a controller that resets while running rejoins and obey
   const r = rig();
   r.app.invoke("api:valves", { active_ids: ALL });
   r.app.invoke("api:start");
-  r.clock.advance(1000);
+  r.clock.advance(RAMP);
   assert.deepEqual(r.bus.openValves(), ALL);
 
   r.node(3).reset();                                 // brown-out / power glitch on controller 3
@@ -194,7 +198,7 @@ test("FAULT valves stuck open: closing the window while valves are open closes e
   const r = rig();
   r.app.invoke("api:valves", { active_ids: ALL });
   r.app.invoke("api:start");
-  r.clock.advance(1000);
+  r.clock.advance(RAMP);
   assert.equal(r.bus.openValves().length, 49);
 
   r.app.closeWindow();
@@ -207,7 +211,8 @@ test("FAULT valves stuck open: quitting (logout, Ctrl+Q, SIGTERM) while valves a
   const r = rig();
   r.app.invoke("api:valves", { active_ids: ALL });
   r.app.invoke("api:start");
-  r.clock.advance(1000);
+  r.clock.advance(RAMP);
+  assert.equal(r.bus.openValves().length, 49);
 
   r.app.quit();
   r.clock.advance(1000);
@@ -229,7 +234,7 @@ test("FAULT valves stuck open: a second copy of the app does not fight over the 
   const r = rig();
   r.app.invoke("api:valves", { active_ids: ALL });
   r.app.invoke("api:start");
-  r.clock.advance(1000);
+  r.clock.advance(RAMP);
 
   // The desktop icon is clicked again while the app is already running.
   const second = loadApp({ clock: r.clock, bus: r.bus, singleInstanceLock: false });
@@ -302,15 +307,34 @@ test("can0 bounced under the running app (ip link down/up): the app keeps contro
   assert.deepEqual(r.bus.openValves(), []);
 });
 
-test("Without the socketcan module the app still runs in simulation", () => {
+test("Without the CAN driver the app says so and refuses to start: it never pretends", () => {
   const r = rig({ app: { socketcanMissing: true } });
   const s = r.app.state();
   assert.equal(s.can_connected, false);
-  assert.equal(s.can_simulated, true);
-  r.app.invoke("api:start");
+  assert.equal(s.can_simulated, false, "a missing driver is an error, not a simulation");
+  assert.equal(s.can_error.label, "CAN DRIVER MISSING");
+  assert.match(r.app.logText(), /socketcan driver could not be loaded/);
+  assert.match(r.app.logText(), /npm run setup/);
+
+  const res = r.app.invoke("api:start");
+  assert.equal(res.status, "blocked");
+  assert.match(res.message, /Cannot start/);
   r.clock.advance(1000);
+  assert.equal(r.app.state().running, false);
+  assert.equal(r.app.state().flow_total, 0);
+});
+
+test("Simulation runs only when it is asked for (MEQAL_SIMULATE=1) and never touches the CAN bus", () => {
+  const r = rig({ app: { env: { MEQAL_SIMULATE: "1" } } });
+  const s = r.app.state();
+  assert.equal(s.can_simulated, true);
+  assert.equal(s.can_error, null);
+  assert.equal(r.app.invoke("api:start").status, "started");
+  r.clock.advance(5000);
   assert.equal(r.app.state().running, true);
   assert.ok(r.app.state().flow_total > 0);
+  assert.equal(r.bus.opened, 0, "simulation must not open can0 even though it exists");
+  assert.deepEqual(r.bus.openValves(), []);
 });
 
 // ----------------------------------------------------------------------------
@@ -338,7 +362,7 @@ test("A single controller restart during a run does not stop the run", () => {
   const r = rig();
   r.app.invoke("api:valves", { active_ids: ALL });
   r.app.invoke("api:start");
-  r.clock.advance(2000);
+  r.clock.advance(RAMP);
   r.node(5).reset();
   r.clock.advance(5000);
   assert.equal(r.app.state().running, true);
@@ -362,12 +386,30 @@ test("A controller fault message (EMCY) is logged with its meaning", () => {
   const r = rig();
   // Controller 3: generic voltage error 0x3000, description 0x40 = supply undervoltage.
   r.bus.nodeTransmit(r.node(3), 0x083, Buffer.from([0x00, 0x30, 0x01, 0x00, 0x40, 0x00, 0x00, 0x00]));
-  // Controller 2: output overload 0xF002 on channel 7 (open circuit) = valve 17.
-  r.bus.nodeTransmit(r.node(2), 0x082, Buffer.from([0x02, 0xF0, 0x01, 0x07, 0x10, 0x00, 0x00, 0x00]));
-  const w = r.app.warnings().join("\n");
+  let w = r.app.warnings().join("\n");
   assert.match(w, /Controller 3 reports a fault: supply voltage out of range \(UNDERVOLTAGE\)/);
-  assert.match(w, /Controller 2 reports a fault: output open\/short circuit on output 7 = valve 17/);
   assert.match(w, /raw 0030010040000000/);
+
+  // The ten frames controller 2 really sent on 2026-10-08 when all 49 valves
+  // were started: one per output, the output number in the high half of byte 3.
+  for (const hex of ["02f0011010000000", "02f0012010000000", "02f0013010000000", "02f0014010000000", "02f0015010000000",
+                     "02f0016010000000", "02f0017010000000", "02f0018010000000", "02f0019010000000", "02f001a010000000"]) {
+    r.bus.nodeTransmit(r.node(2), 0x082, Buffer.from(hex, "hex"));
+  }
+  r.clock.advance(500);
+  w = r.app.warnings().join("\n");
+  assert.match(w, /Controller 2 could not drive the commanded current on outputs 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 \(valves 11, 12, 13, 14, 15, 16, 17, 18, 19, 20\) — supply voltage too low/);
+  assert.equal(w.match(/Controller 2 could not drive/g).length, 1, "ten frames, one line");
+
+  // A single output is more likely a wiring fault, and a plain number is accepted too.
+  r.bus.nodeTransmit(r.node(5), 0x085, Buffer.from([0x02, 0xF0, 0x01, 0x70, 0x10, 0x00, 0x00, 0x00]));
+  r.clock.advance(500);
+  assert.match(r.app.warnings().join("\n"), /Controller 5 could not drive the commanded current on output 7 \(valve 47\) — coil disconnected or shorted/);
+
+  // "Error reset" frames: silent while faults remain, one line when all are gone.
+  r.bus.nodeTransmit(r.node(2), 0x082, Buffer.from("0000010000000000", "hex"));
+  r.bus.nodeTransmit(r.node(2), 0x082, Buffer.from("0000000000000000", "hex"));
+  assert.equal(r.app.logText().match(/Controller 2: all faults cleared/g).length, 1);
 });
 
 test("Garbage on the bus never crashes the app or confuses it for long", () => {
@@ -420,23 +462,30 @@ test("The UI is told when a controller drops out and when it returns", () => {
   assert.match(String(p.notice), /Controller 2 is back/);
 });
 
-test("A simulated run never turns into real open valves when can0 appears", () => {
+test("can0 missing at launch: Start is refused, and nothing opens by itself when the interface appears", () => {
   const r = rig({ bus: { present: false } });
+  let s = r.app.state();
+  assert.equal(s.can_simulated, false, "missing hardware is an error, not a simulation");
+  assert.equal(s.can_error.label, "NO can0");
+
   r.app.invoke("api:valves", { active_ids: ALL });
-  r.app.invoke("api:start");                          // "running" in simulation
-  r.clock.advance(5000);
+  const res = r.app.invoke("api:start");
+  assert.equal(res.status, "blocked");
+  assert.equal(r.app.state().running, false);
 
-  r.bus.present = true;                               // the interface shows up mid-run
-  for (let i = 0; i < 120; i++) {                     // two more minutes of the simulated run
-    r.clock.advance(1000);
-    assert.deepEqual(r.bus.openValves(), [], "a real valve opened during a simulated run");
+  r.bus.present = true;                               // the CAN board shows up
+  for (let i = 0; i < 50; i++) {
+    r.clock.advance(100);
+    assert.deepEqual(r.bus.openValves(), [], "a valve opened by itself");
   }
-  assert.equal(r.bus.opened, 0, "must not connect while a simulated run is in progress");
+  s = r.app.state();
+  assert.equal(s.can_connected, true, "connects by itself");
+  assert.equal(s.can_error, null);
+  assert.equal(s.running, false);
 
-  r.app.invoke("api:stop");
-  r.clock.advance(35000);
-  assert.equal(r.app.state().can_connected, true, "connects once idle");
-  assert.deepEqual(r.bus.openValves(), []);
+  assert.equal(r.app.invoke("api:start").status, "started");
+  r.clock.advance(RAMP);
+  assert.deepEqual(r.bus.openValves(), ALL);
 });
 
 test("Exit reports when it could not close the valves", () => {
@@ -467,7 +516,7 @@ test("Stop and Emergency Stop still close everything while a controller is resta
   const r = rig();
   r.app.invoke("api:valves", { active_ids: ALL });
   r.app.invoke("api:start");
-  r.clock.advance(1000);
+  r.clock.advance(RAMP);
   r.node(1).reset();
   r.clock.advance(150);                               // controller 1 is mid-boot
   r.app.invoke("api:emergency");
@@ -480,7 +529,7 @@ test("FAULT valves stuck open: a controller knocked out of operational while ope
   const r = rig();
   r.app.invoke("api:valves", { active_ids: ALL });
   r.app.invoke("api:start");
-  r.clock.advance(1000);
+  r.clock.advance(RAMP);
 
   // Another tool on the bus sends NMT "enter pre-operational" to controller 3
   // (no reset, no boot-up message): it stops listening but keeps driving.
@@ -507,7 +556,7 @@ test("A long can0 outage: one message, no reconnect storm, control is back when 
   const r = rig();
   r.app.invoke("api:valves", { active_ids: ALL });
   r.app.invoke("api:start");
-  r.clock.advance(1000);
+  r.clock.advance(RAMP);
 
   r.bus.linkDown();
   r.clock.advance(20000);
@@ -545,18 +594,22 @@ test("A flapping can0 link does not flood the log and ends up connected", () => 
   assert.deepEqual(r.bus.openValves(), [9, 31]);
 });
 
-test("can0 still down at launch: the app waits, connects when it comes up, and never starts valves on its own", () => {
+test("can0 still down at launch: the app waits, refuses Start, connects when the link comes up", () => {
   const r = rig({ bus: { up: false } });
   let s = r.app.state();
   assert.equal(s.can_connected, false);
-  assert.equal(s.can_simulated, false, "hardware is present: show NO CAN, not CAN SIM");
+  assert.equal(s.can_simulated, false);
+  assert.equal(s.can_error.label, "can0 IS DOWN");
   assert.match(r.app.warnings().join("\n"), /can0 exists but is DOWN/);
   assert.equal(r.bus.opened, 0);
 
   r.app.invoke("api:valves", { active_ids: ALL });
-  r.app.invoke("api:start");                          // pressed with NO CAN showing
+  const res = r.app.invoke("api:start");              // pressed with "can0 IS DOWN" showing
+  assert.equal(res.status, "blocked");
+  assert.match(res.message, /can-up\.sh/);
   r.clock.advance(5000);
   assert.equal(r.bus.opened, 0, "still nothing opened while down");
+  assert.equal(r.app.state().running, false);
 
   r.bus.linkUp();                                     // can-up.sh is run now
   for (let i = 0; i < 50; i++) {
@@ -565,10 +618,294 @@ test("can0 still down at launch: the app waits, connects when it comes up, and n
   }
   s = r.app.state();
   assert.equal(s.can_connected, true);
-  assert.equal(s.running, false, "the run that had no hardware is stopped, not continued on real valves");
-  assert.match(r.app.warnings().join("\n"), /CAN came up during a run that had no hardware/);
+  assert.equal(s.running, false);
 
-  r.app.invoke("api:start");                          // now the operator starts for real
-  r.clock.advance(500);
+  assert.equal(r.app.invoke("api:start").status, "started");
+  r.clock.advance(RAMP);
   assert.deepEqual(r.bus.openValves(), ALL);
+});
+
+// ----------------------------------------------------------------------------
+// Normal mode with many valves (the 2026-10-08 fault: all 49 started in the
+// same instant made the 12 V supply collapse and controllers 1, 3, 4 restart)
+// ----------------------------------------------------------------------------
+test("NORMAL MODE: all 49 valves open gradually, stay open until Stop, then close", () => {
+  const r = rig();
+  r.app.invoke("api:valves", { active_ids: ALL });
+  assert.equal(r.app.invoke("api:start").status, "started");
+
+  let prev = 0;
+  for (let i = 0; i < 30; i++) {                      // first 3 s, sampled every 100 ms
+    r.clock.advance(100);
+    const n = r.bus.openValves().length;
+    assert.ok(n >= prev, "valves only join during the start");
+    assert.ok(n - prev <= 4, `${n - prev} valves opened within 100 ms`);
+    prev = n;
+  }
+  assert.deepEqual(r.bus.openValves(), ALL, "all 49 are open 3 s after Start");
+  assert.ok(r.bus.peakStep <= 4, `at most a few valves switch together (saw ${r.bus.peakStep})`);
+
+  for (let i = 0; i < 600; i++) {                     // ten minutes: nothing changes by itself
+    r.clock.advance(1000);
+    if (i % 60 === 0) assert.deepEqual(r.bus.openValves(), ALL);
+  }
+  assert.equal(r.app.state().running, true);
+  assert.deepEqual(r.app.state().active_ids, ALL);
+  for (let id = 1; id <= 5; id++) assert.equal(r.node(id).boots, 1, `controller ${id} never restarted`);
+
+  r.app.invoke("api:stop");
+  r.clock.advance(300);
+  assert.deepEqual(r.bus.openValves(), [], "Stop closes at once, not gradually");
+});
+
+test("NORMAL MODE: a supply that cannot take 49 valves switching together no longer resets the controllers", () => {
+  // More than 8 valves switching on within 100 ms collapses the supply and
+  // controllers 1, 3 and 4 restart — what the rig did on every Start.
+  const r = rig({ bus: { psu: { maxStep: 8 } } });
+  r.app.invoke("api:valves", { active_ids: ALL });
+  r.app.invoke("api:start");
+  r.clock.advance(60000);
+  assert.equal(r.bus.brownOuts, 0, "the supply collapsed");
+  assert.equal(r.app.state().running, true);
+  assert.deepEqual(r.bus.openValves(), ALL);
+  assert.doesNotMatch(r.app.warnings().join("\n"), /restarted/);
+});
+
+test("NORMAL MODE: several valves on one controller, and rows and columns, hold until Stop", () => {
+  for (const sel of [range(1, 10), range(22, 28), [3, 10, 17, 24, 31, 38, 45], range(1, 20)]) {
+    const r = rig({ bus: { psu: { maxStep: 8 } } });
+    r.app.invoke("api:valves", { active_ids: sel });
+    r.app.invoke("api:start");
+    r.clock.advance(30000);
+    assert.deepEqual(r.bus.openValves(), sel);
+    assert.equal(r.bus.brownOuts, 0);
+    assert.equal(r.app.state().running, true);
+  }
+});
+
+test("NORMAL MODE: a controller that restarts mid-run gets its valves back a few at a time", () => {
+  const r = rig({ bus: { psu: { maxStep: 8, weak: [3] } } });
+  r.app.invoke("api:valves", { active_ids: ALL });
+  r.app.invoke("api:start");
+  r.clock.advance(RAMP);
+  r.node(3).reset();                                  // one glitch on controller 3
+  r.clock.advance(6000);
+  assert.equal(r.bus.brownOuts, 0, "its return must not be a 10-valve step");
+  assert.equal(r.node(3).boots, 2, "exactly one restart");
+  assert.deepEqual(r.bus.openValves(), ALL);
+  assert.equal(r.app.state().running, true);
+});
+
+test("A supply that cannot hold the load: the run stops, says how many valves were open, and Start is blocked for a while", () => {
+  const r = rig({ bus: { psu: { maxValves: 30 } } });   // collapses when the 31st valve opens
+  r.app.invoke("api:valves", { active_ids: ALL });
+  r.app.invoke("api:start");
+  let waited = 0;
+  while (r.app.state().running && waited < 30000) { r.clock.advance(50); waited += 50; }
+
+  const s = r.app.state();
+  assert.equal(s.running, false, "the run was stopped");
+  const w = r.app.warnings().join("\n");
+  // The load is reported as it was when the controller went quiet (31 valves:
+  // the supply holds 30), not as it is when the restart message arrives.
+  const m = w.match(/restarted \(boot-up message #\d+\)\. It went quiet with (\d+) valves open \((\d+) on this controller\)/);
+  assert.ok(m, "restart is logged with the load at the time");
+  assert.ok(Number(m[1]) >= 30 && Number(m[1]) <= 33, `reported ${m[1]} valves open, the supply collapses at 31`);
+  assert.match(w, /STOPPED with \d+ valves open\. The 12 V supply \(or its wiring\) cannot carry this many valves/);
+  r.clock.advance(300);
+  assert.deepEqual(r.bus.openValves(), []);
+
+  // Start pressed again straight away: refused, with the reason, and nothing moves.
+  const before = r.bus.brownOuts;
+  assert.ok(r.app.state().start_blocked_ms > 8000);
+  const res = r.app.invoke("api:start");
+  assert.equal(res.status, "blocked");
+  assert.match(res.message, /Start is blocked for \d+ s: controller \d keeps losing power/);
+  r.clock.advance(5000);
+  assert.equal(r.app.state().running, false);
+  assert.deepEqual(r.bus.openValves(), []);
+  assert.equal(r.bus.brownOuts, before, "a refused Start must not touch the valves");
+
+  // After the cool-down the operator may try again, here with fewer valves.
+  r.clock.advance(40000);                             // past the cool-down and the restart window
+  assert.equal(r.app.state().start_blocked_ms, 0);
+  r.app.invoke("api:valves", { active_ids: range(1, 25) });
+  assert.equal(r.app.invoke("api:start").status, "started");
+  r.clock.advance(RAMP);
+  assert.deepEqual(r.bus.openValves(), range(1, 25));
+  assert.equal(r.app.state().running, true);
+});
+
+test("Start pressed again and again cannot put the controllers through a restart loop", () => {
+  // On 2026-10-08 Start arrived about once a second for 12 minutes and the
+  // controllers restarted 1055 times. Same supply fault, same hammering:
+  const r = rig({ bus: { psu: { maxValves: 30 } } });
+  r.app.invoke("api:valves", { active_ids: ALL });
+  for (let i = 0; i < 1200; i++) {                    // Start every 100 ms for 2 minutes
+    r.app.invoke("api:start");
+    r.clock.advance(100);
+  }
+  for (const id of [1, 3, 4]) {
+    assert.ok(r.node(id).boots - 1 <= 16, `controller ${id} restarted ${r.node(id).boots - 1} times in 2 minutes`);
+  }
+  r.app.invoke("api:stop");
+  r.clock.advance(500);
+  assert.deepEqual(r.bus.openValves(), []);
+});
+
+test("Start while already running changes nothing", () => {
+  const r = rig();
+  r.app.invoke("api:set_mode", { mode: "natural" });
+  r.app.invoke("api:valves", { active_ids: range(1, 5) });
+  assert.equal(r.app.invoke("api:start").status, "started");
+  r.clock.advance(300);
+  const flowBefore = r.app.state().flow_total;
+  assert.equal(r.app.invoke("api:start").status, "running");
+  assert.equal(r.app.invoke("api:start").status, "running");
+  r.clock.advance(100);
+  assert.ok(r.app.state().flow_total >= flowBefore);
+  assert.equal(r.app.logText().match(/\[SYSTEM\] Started/g).length, 1, "one run, one log line");
+});
+
+test("Valves on a controller that is not responding are not shown or counted as open", () => {
+  const r = rig({ lateNodes: [1], settleMs: 3000 });  // controller 1 has no power
+  r.app.invoke("api:valves", { active_ids: ALL });
+  r.app.invoke("api:start");
+  r.clock.advance(10000);
+  const s = r.app.state();
+  assert.deepEqual(r.bus.openValves(), range(11, 49));
+  for (let v = 1; v <= 10; v++) {
+    assert.equal(s.valve_states[v], false, `valve ${v} drawn as open although its controller is dead`);
+    assert.equal(s.valve_flow_accum[v], 0, `flow counted for valve ${v}`);
+  }
+  assert.ok(s.valve_flow_accum[11] > 0);
+
+  r.node(1).powerOn();                                // power arrives mid-run
+  r.clock.advance(3000);
+  assert.deepEqual(r.bus.openValves(), ALL, "its valves join the run");
+});
+
+test("Natural mode with all 49 valves does not switch them all on in the same instant either", () => {
+  const r = rig({ bus: { psu: { maxStep: 14 } } });
+  r.app.invoke("api:set_mode", { mode: "natural" });
+  r.app.invoke("api:valves", { active_ids: ALL });
+  r.app.invoke("api:start");
+  const seen = new Set();
+  for (let i = 0; i < 300; i++) { r.clock.advance(100); for (const v of r.bus.openValves()) seen.add(v); }
+  assert.equal(r.bus.brownOuts, 0);
+  assert.equal(seen.size, 49, "every valve took part");
+  assert.equal(r.app.state().running, true);
+});
+
+// ----------------------------------------------------------------------------
+// Supply voltage and MQTT
+// ----------------------------------------------------------------------------
+test("The controllers' supply voltage is read, shown, and a sag under load is reported", () => {
+  const r = rig({ bus: { psu: { volts: 12.1, sagPerValve: 0.05 } }, settleMs: 4000 });
+  assert.deepEqual(r.app.state().supply_v, [12.1, 12.1, 12.1, 12.1, 12.1]);
+
+  const idleReads = r.bus.sdoReads;
+  r.clock.advance(10000);
+  assert.ok(r.bus.sdoReads - idleReads <= 30, "idle polling stays light");
+
+  r.app.invoke("api:valves", { active_ids: ALL });
+  r.app.invoke("api:start");
+  r.clock.advance(6000);
+  const v = r.app.state().supply_v;                   // 49 valves x 0.05 V = 2.45 V of sag
+  for (const x of v) assert.ok(Math.abs(x - 9.65) < 0.11, `expected about 9.65 V, got ${x}`);
+  assert.match(r.app.warnings().join("\n"), /\[POWER\] Controller \d supply is sagging: \d+\.\d V with \d+ valves open/);
+
+  r.app.invoke("api:stop");
+  assert.match(r.app.logText(), /\[POWER\] stopped: lowest supply seen during the run — c1 9\.\d V/);
+  assert.equal(r.bus.stats.enobufs, 0, "polling must not crowd the transmit queue");
+});
+
+test("MQTT: state and flow are published during a run and the record ends with everything closed", () => {
+  const r = rig();
+  assert.equal(r.app.state().mqtt_connected, true);
+  assert.equal(r.app.state().mqtt_error, null);
+  r.app.invoke("api:valves", { active_ids: [1, 49] });
+  const res = r.app.invoke("api:start");
+  assert.equal(res.mqtt_warning, null);
+  r.clock.advance(1000);
+  const tila = r.broker.last("venttiilit/tila").split(",");
+  assert.equal(tila.length, 49);
+  assert.equal(tila[0], "370");
+  assert.equal(tila[1], "290");
+  assert.equal(tila[48], "370");
+  assert.equal(r.broker.last("venttiilit/flow_inc").split(",").length, 49);
+
+  r.app.invoke("api:stop");
+  assert.ok(r.broker.last("venttiilit/tila").split(",").every(x => x === "290"), "last state on the broker is all closed");
+  assert.ok(r.broker.last("venttiilit/flow_inc").split(",").every(x => Number(x) === 0));
+});
+
+test("MQTT: a broker that is down is reported, the run warns, and it reconnects by itself", () => {
+  const r = rig({ brokerUp: false });
+  let s = r.app.state();
+  assert.equal(s.mqtt_connected, false);
+  assert.match(s.mqtt_error, /broker not reachable/);
+  const res = r.app.invoke("api:start");
+  assert.equal(res.status, "started", "MQTT being down does not stop the valves from working");
+  assert.match(res.mqtt_warning, /broker not reachable/);
+  assert.match(r.app.warnings().join("\n"), /This run is NOT being published/);
+
+  r.broker.start();
+  r.clock.advance(6000);
+  s = r.app.state();
+  assert.equal(s.mqtt_connected, true, "reconnected without restarting the app");
+  assert.equal(s.mqtt_error, null);
+
+  r.broker.stop();                                    // broker restarts mid-session
+  r.clock.advance(1000);
+  assert.equal(r.app.state().mqtt_connected, false);
+  assert.match(String(r.app.status.lastPush && r.app.logText()), /Connection lost — retrying/);
+  r.broker.start();
+  r.clock.advance(6000);
+  assert.equal(r.app.state().mqtt_connected, true);
+  assert.ok(r.app.warnings().filter(w => /\[MQTT\]/.test(w)).length <= 3, "no log flood while the broker is down");
+});
+
+test("MQTT: a missing library is named as such, with the fix", () => {
+  const r = rig({ app: { mqttMissing: true } });
+  const s = r.app.state();
+  assert.equal(s.mqtt_connected, false);
+  assert.match(s.mqtt_error, /not installed/);
+  assert.match(r.app.warnings().join("\n"), /mqtt library could not be loaded.*npm run setup/);
+  r.clock.advance(120000);
+  assert.equal(r.app.warnings().filter(w => /mqtt library/.test(w)).length, 1, "said once, not every 30 s");
+});
+
+test("NORMAL MODE: the gradual start is spread evenly over the five controllers", () => {
+  const r = rig();
+  r.app.invoke("api:valves", { active_ids: ALL });
+  r.app.invoke("api:start");
+  for (let step = 0; step < 20; step++) {
+    r.clock.advance(100);
+    const perCtrl = [0, 0, 0, 0, 0];
+    for (const v of r.bus.openValves()) perCtrl[Math.floor((v - 1) / 10)]++;
+    const spread = Math.max(...perCtrl) - Math.min(...perCtrl);
+    assert.ok(spread <= 2, `after ${(step + 1) * 100} ms the controllers carry ${perCtrl.join("/")} valves`);
+  }
+});
+
+test("Supply-voltage answers are accepted with or without a stated size, and nothing else is mistaken for one", () => {
+  const r = rig({ settleMs: 3000 });
+  const answer = (cmd, volts, idx = [0x20, 0x50, 0x00]) => {
+    const b = Buffer.from([cmd, ...idx, 0, 0, 0, 0]); b.writeFloatLE(volts, 4); return b;
+  };
+  const deliver = (id, data) => { for (const c of r.bus.channels) c._deliver({ id, data }); };
+  const volts = () => r.app.state().supply_v[1];      // controller 2
+
+  deliver(0x582, answer(0x43, 11.5));                 // size stated: 4 bytes
+  assert.equal(volts(), 11.5);
+  deliver(0x582, answer(0x42, 11.2));                 // size not stated
+  assert.equal(volts(), 11.2);
+
+  deliver(0x582, answer(0x4B, 5.0));                  // a 2-byte answer: not a float
+  deliver(0x582, answer(0x80, 5.0));                  // an SDO abort
+  deliver(0x582, answer(0x43, 5.0, [0x00, 0x10, 0x00])); // another object (1000h)
+  deliver(0x582, answer(0x43, NaN));
+  deliver(0x582, answer(0x43, 4000));                 // nonsense value
+  assert.equal(volts(), 11.2, "only a valid 5020h answer changes the reading");
 });

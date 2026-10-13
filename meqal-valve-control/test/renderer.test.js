@@ -41,11 +41,12 @@ function loadRenderer() {
 
   let onState = null;
   const calls = [];
+  const replies = { start: { status: "started" } };   // what the backend answers; tests change it
   const api = new Proxy({}, {
     get: (_t, name) => {
       if (name === "onStateUpdate") return (cb) => { onState = cb; };
       if (name === "getState") return async () => ({ active_ids: [], valve_states: [], running: false });
-      return async (...args) => { calls.push([name, ...args]); return { status: "ok", mode: args[0] }; };
+      return async (...args) => { calls.push([name, ...args]); return replies[name] || { status: "ok", mode: args[0] }; };
     },
   });
 
@@ -67,7 +68,12 @@ function loadRenderer() {
     ["window", "document", "setInterval", "setTimeout", "clearTimeout", "Chart"], { filename: file });
   fn(window, document, () => 0, () => 0, () => {}, undefined);
 
-  return { byId, push: (state) => onState(state), calls, box: (i) => byId(`valve-${i}`) };
+  const click = async (id) => {
+    let blurred = false;
+    for (const fn of byId(id).listeners.click || []) await fn({ currentTarget: { blur() { blurred = true; } } });
+    return blurred;
+  };
+  return { byId, push: (state) => onState(state), calls, replies, click, box: (i) => byId(`valve-${i}`) };
 }
 
 const base = {
@@ -123,8 +129,14 @@ test("Stuck-open valve, transmit failure, simulation and lost link are all shown
   assert.equal(ui.box(13).classes.has("stuck"), false, "flags clear when the state clears");
 
   ui.push({ ...base, can_connected: false, can_simulated: true, controllers: base.controllers.map(c => ({ ...c, status: "unknown" })) });
-  assert.equal(ui.byId("canStatus").textContent, "CAN SIM");
+  assert.equal(ui.byId("canStatus").textContent, "SIMULATION \u2014 no valve moves");
+  assert.equal(ui.byId("canDot").className, "can-dot err", "simulation is never shown as healthy");
   assert.equal(ui.box(1).classes.has("nolink"), false, "simulation never marks valves as lost");
+
+  ui.push({ ...base, can_connected: false, can_simulated: false,
+            can_error: { label: "CAN DRIVER MISSING", detail: "The CAN driver (socketcan) is not installed for this app." } });
+  assert.equal(ui.byId("canStatus").textContent, "CAN DRIVER MISSING");
+  assert.match(ui.byId("canStatus").title, /socketcan/);
 
   ui.push({ ...base, can_connected: false, can_simulated: false });
   assert.equal(ui.byId("canStatus").textContent, "NO CAN");
@@ -147,4 +159,42 @@ test("A state from an older backend (no controller fields) still renders", () =>
   ui.push({ running: false, active_ids: [3], valve_states: [], can_connected: true, can_simulated: false });
   assert.equal(ui.byId("canStatus").textContent, "CAN OK");
   assert.equal(ui.box(3).classes.has("online"), true);
+});
+
+test("Supply voltage and MQTT state are shown in the status bar", () => {
+  const ui = loadRenderer();
+  ui.push({ ...base, supply_v: [12.1, 12.0, 12.1, 12.0, 12.0], mqtt_connected: true, mqtt_error: null });
+  assert.equal(ui.byId("supplyStatus").textContent, "12.0 V");
+  assert.match(ui.byId("supplyStatus").title, /4: 12\.0 V/);
+  assert.equal(ui.byId("mqttStatus").textContent, "MQTT OK");
+  assert.equal(ui.byId("mqttDot").className, "can-dot ok");
+
+  ui.push({ ...base, supply_v: [11.9, 9.4, null, 11.2, 12.0], mqtt_connected: false, mqtt_error: "MQTT broker not reachable on localhost:1883" });
+  assert.equal(ui.byId("supplyStatus").textContent, "9.4 V", "the lowest reading is the one that matters");
+  assert.equal(ui.byId("supplyStatus").style.color, "var(--red)");
+  assert.equal(ui.byId("mqttStatus").textContent, "NO MQTT");
+  assert.match(ui.byId("mqttStatus").title, /broker not reachable/);
+
+  ui.push({ ...base, supply_v: [null, null, null, null, null] });
+  assert.equal(ui.byId("supplyStatus").textContent, "\u2013 V");
+});
+
+test("Start tells the operator when it was refused, and lets go of keyboard focus", async () => {
+  const ui = loadRenderer();
+  ui.replies.start = { status: "blocked", message: "Start is blocked for 9 s: controller 4 keeps losing power when its valves open." };
+  const blurred = await ui.click("startBtn");
+  assert.equal(blurred, true);
+  assert.match(ui.byId("toast").textContent, /Start is blocked for 9 s/);
+
+  ui.replies.start = { status: "running" };
+  await ui.click("startBtn");
+  assert.equal(ui.byId("toast").textContent, "Already running");
+
+  ui.replies.start = { status: "started", mqtt_warning: "MQTT broker not reachable on localhost:1883" };
+  await ui.click("startBtn");
+  assert.match(ui.byId("toast").textContent, /NOT publishing/);
+
+  ui.replies.start = { status: "started", mqtt_warning: null };
+  await ui.click("startBtn");
+  assert.match(ui.byId("toast").textContent, /System started/);
 });
