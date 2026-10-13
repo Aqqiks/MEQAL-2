@@ -6,6 +6,7 @@
   "scripts": {
     "start": "ELECTRON_OZONE_PLATFORM_HINT=auto electron .",
     "dev": "ELECTRON_OZONE_PLATFORM_HINT=auto electron . --dev",
+    "test": "node --test test/*.test.js",
     "rebuild:socketcan": "electron-rebuild -f -w socketcan",
     "build": "electron-builder --linux --win",
     "build:linux": "electron-builder --linux",

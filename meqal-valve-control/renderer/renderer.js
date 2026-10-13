@@ -13,6 +13,7 @@
 
 const GRID_SIZE        = 7;
 const VALVE_COUNT      = 49;
+const VALVES_PER_CTRL  = 10;             // valves per CAN controller (matches main.js)
 
 // --- Local UI state ----------------------------------------------------------
 let activeValves   = new Set();
@@ -375,9 +376,23 @@ function updateUi(state) {
   sysStatus.textContent = isRunning ? "RUNNING" : "IDLE";
   sbStatus.textContent  = isRunning ? `Running \u00B7 ${actCount} valves active` : "System idle";
 
-  const connected       = !!state.can_connected;
-  canDot.className      = "can-dot " + (connected ? "ok" : "err");
-  canStatus.textContent = connected ? "CAN OK" : (state.can_simulated ? "CAN SIM" : "NO CAN");
+  // CAN link + controller health. "CAN OK" only when frames are leaving the
+  // Pi AND every controller is answering — an open socket alone proves nothing.
+  const connected = !!state.can_connected;
+  const txOk      = state.can_tx_ok !== false;
+  const ctrls     = state.controllers || [];
+  const answering = ctrls.filter(c => c.status === "online").length;
+  const offline   = new Set(connected ? (state.offline_controllers || []) : []);
+  const stuck     = new Set(connected ? (state.stuck_open_ids || []) : []);
+  let canText;
+  if (!connected)        canText = state.can_simulated ? "CAN SIM" : "NO CAN";
+  else if (!txOk)        canText = "CAN TX FAILING";
+  else if (offline.size) canText = `CONTROLLER ${Array.from(offline).join(", ")} NOT RESPONDING`;
+  else                   canText = ctrls.length ? `CAN OK · ${answering}/${ctrls.length} controllers` : "CAN OK";
+  if (stuck.size) canText += ` · VALVE ${Array.from(stuck).join(", ")} STILL OPEN`;
+  const healthy = connected && txOk && !offline.size && !stuck.size && answering === ctrls.length;
+  canDot.className      = "can-dot " + (healthy ? "ok" : "err");
+  canStatus.textContent = canText;
 
   if (state.mode) { currentMode = state.mode; reflectMode(); }
 
@@ -391,9 +406,19 @@ function updateUi(state) {
     const isSelected = activeValves.has(i);
     const isOpen     = state.valve_states ? !!state.valve_states[i] : false;
     const isLimited  = limited.has(i);
+    // A valve whose controller is not answering is not under our control,
+    // whatever we commanded — never draw it as simply "open".
+    const ctrl       = Math.floor((i - 1) / VALVES_PER_CTRL) + 1;
+    const noLink     = connected && (!txOk || offline.has(ctrl));
+    const isStuck    = stuck.has(i);
     box.classList.toggle("online", isSelected || isOpen);
     box.classList.toggle("done", isLimited && !isSelected && !isOpen);
+    box.classList.toggle("nolink", noLink);
+    box.classList.toggle("stuck", isStuck);
     box.classList.remove("offline");
+    box.title = isStuck ? `Valve ${i}: still driven although commanded closed`
+              : noLink  ? `Valve ${i}: controller ${ctrl} is not responding`
+              : "";
   }
   reflectSelectAll();
 
@@ -428,6 +453,8 @@ function updateUi(state) {
 window.api.onStateUpdate((state) => {
   updateUi(state);
   if (state.auto_stopped) toast("Timer elapsed — system stopped");
+  // Controller / CAN events from the main process (restart, lost, fault…).
+  if (state.notice) toast(state.notice, !!state.notice_error);
 });
 
 async function loadInitialState() {

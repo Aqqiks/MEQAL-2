@@ -119,3 +119,51 @@ All TX is paced through a small queue (one frame every ~4 ms) so the Pi's
 frames). On connect the app emits the NMT "start all nodes" frame; while idle
 it actively re-asserts all-closed; on stop/emergency it sends paced all-closed
 sweeps (5× on emergency).
+
+## Controller supervision
+
+The controllers are Axiomatic AX021211 units. Three properties of theirs
+(manual UMAX021211, and read back from the units over SDO) shape the app:
+
+- They only obey valve commands while **OPERATIONAL**. After every power-up or
+  reset they wait in PRE-OPERATIONAL, alive on the bus but ignoring commands,
+  until they receive an NMT "start".
+- They **hold their last command** for as long as they have power. There is no
+  receive timeout configured, so a valve told to open stays open until it is
+  told to close.
+- A command below 300 switches the output off; otherwise the value is the coil
+  current in mA. That is why `290` closes and `370` opens.
+
+So the app listens to the bus as well as talking to it:
+
+- A controller that stops reporting, or announces a restart, is started again
+  automatically. The status bar names any controller that is not responding
+  and its valves are drawn with a dashed red border: they are not under
+  control, whatever was commanded.
+- A controller that restarts three times within 30 s during a run ends the
+  run. This usually means its supply voltage sags when the coils switch on.
+- Fault messages from the controllers (EMCY) are decoded into the log.
+- A valve that a controller still drives 1.5 s after it was told to close is
+  flagged as stuck.
+- On exit every valve is commanded closed and the app waits until the frames
+  have actually left the Pi.
+- Only one copy of the app runs. Starting it again brings the running one to
+  the front and leaves the CAN bus alone.
+
+What the app cannot cover: if the Pi loses power, or the process is killed
+outright, nothing sends "close" and the controllers keep holding. Closing the
+valves in that case needs the receive timeout on the controllers themselves
+(objects 1400h–1402h sub 5) together with a fault value of 0 mA (7341h), which
+defaults to 500 mA, i.e. open.
+
+All of this is logged to `~/.meqal-valve.log` with a `[CAN]` prefix.
+
+## Tests
+
+```bash
+npm test
+```
+
+Runs the real `src/main.js` and `renderer/renderer.js` against a simulated CAN
+bus and five simulated controllers (`test/sim.js`). No hardware and no window
+are involved, and it takes a couple of seconds.

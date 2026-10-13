@@ -152,6 +152,10 @@
   .box.online { background: var(--green-dim); border-color: var(--green); color: #fff; box-shadow: 0 0 8px rgba(34,197,94,0.4); }
   .box.offline { background: #2a1010; border-color: var(--red-dim); color: rgba(239,68,68,0.5); }
   .box.done { background: rgba(245,158,11,0.12); border-color: var(--amber); color: var(--amber); }
+  /* Controller not answering: the valve is not under our control. */
+  .box.nolink { background: #1a1214; border: 1px dashed var(--red); color: rgba(239,68,68,0.8); box-shadow: none; }
+  /* Controller still drives it although it was commanded closed. */
+  .box.stuck { background: var(--red-dim); border: 1px solid var(--red); color: #fff; box-shadow: 0 0 10px rgba(239,68,68,0.7); }
 
   .mini-chart-wrap { height: 80px; margin-top: 10px; }
 
