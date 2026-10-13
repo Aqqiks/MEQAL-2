@@ -1,8 +1,39 @@
 # MEQAL Valve Control
 
 Electron desktop app controlling a 7×7 (49-valve) gas manifold over CANopen,
-with optional MQTT mirroring. Runs fully even without CAN hardware
-(simulation mode), so you can develop and demo on any OS.
+publishing valve state and flow over MQTT. It expects the real hardware and
+says so when something is missing; simulation exists only on request
+(`npm run sim`).
+
+The full guide (daily use, how it works, installing, maintaining,
+troubleshooting) is here:
+https://claude.ai/code/artifact/ff73e86c-570a-4615-a176-f97e755e19bd
+
+## Set up a fresh checkout
+
+```bash
+npm run setup
+```
+
+Installs the packages, proves that `socketcan` and `mqtt` really load inside
+the app's Electron (restoring the prebuilt copies in `vendor/` when a download
+or a build failed), and points the desktop icon at this folder. `npm run
+doctor` runs the same check without changing anything.
+
+## Install (prebuilt AppImage)
+
+Download `MEQAL-Valve-Control-1.0.0-arm64.AppImage` from the
+[Releases page](https://github.com/Aqqiks/MEQAL-2/releases) (arm64 / Raspberry
+Pi only), then make it executable and run it:
+
+```bash
+chmod +x MEQAL-Valve-Control-1.0.0-arm64.AppImage
+./MEQAL-Valve-Control-1.0.0-arm64.AppImage
+```
+
+The AppImage does not bring the CAN bus up: run `scripts/can-up.sh` first.
+Check the release date against the code; build a current one with
+`npm run build:linux`.
 
 ## Run
 
@@ -16,16 +47,20 @@ The simplest way on the Raspberry Pi is the **desktop launcher**
 To run by hand:
 
 ```bash
-npm install          # installs electron + electron-builder (native CAN/MQTT are optional)
+npm run setup            # once per checkout (see above)
 bash scripts/launch.sh   # CAN bring-up + app, exactly like the desktop icon
-# or, without touching CAN:
-npm start            # launch the app
-npm run dev          # launch with DevTools open
+# or, with the CAN bus already up:
+npm start                # launch the app
+npm run dev              # launch with DevTools open
+npm run sim              # no hardware at all: nothing reaches a valve
 ```
 
-`npm install` never fails on missing native build tools: `socketcan` and `mqtt`
-are **optional**. Without them the app runs in CAN **simulation** mode (status
-bar shows `CAN SIM`).
+`socketcan` and `mqtt` are listed as optional so that the project still
+installs on a non-Linux machine, but the dashboard cannot work without them.
+A plain `npm install` builds `socketcan` for the system's Node.js, which the
+app's Electron cannot load; the check that runs after every install fixes that
+from `vendor/`. If the CAN driver is still missing the app shows
+`CAN DRIVER MISSING` and refuses to start a run.
 
 ### CAN bring-up (Linux only)
 
@@ -36,7 +71,6 @@ sudo ip link set can0 down                              # required: can't re-bit
 sudo ip link set can0 type can bitrate 125000 restart-ms 100
 sudo ip link set can0 up
 cansend can0 000#010027F000000000                       # NMT: start all nodes
-npm run rebuild:socketcan                               # (once) build the native addon for Electron
 ```
 
 The bus runs at **125000 bit/s**. A wrong bitrate (e.g. 500000) drives the
@@ -57,6 +91,9 @@ opening" symptom. `restart-ms 100` lets the controller auto-recover from
 
 - **Start** — opens the selected valves (or **all 49** if none are selected)
   and runs in the current mode until the cap, **Stop**, or **Emergency Stop**.
+  Valves open a few at a time (all 49 take 2.5 s): switching them all on in
+  the same instant made the 12 V supply collapse. Start is refused, with the
+  reason, when there is no CAN link or right after a protective stop.
   Start and Stop are distinct buttons (no double-press gesture).
 - **Normal (all)** — selects every valve and runs continuous flow: opens all
   valves and keeps releasing gas until the per-valve cap, Stop, or Emergency.
@@ -108,3 +145,55 @@ All TX is paced through a small queue (one frame every ~4 ms) so the Pi's
 frames). On connect the app emits the NMT "start all nodes" frame; while idle
 it actively re-asserts all-closed; on stop/emergency it sends paced all-closed
 sweeps (5× on emergency).
+
+## Controller supervision
+
+The controllers are Axiomatic AX021211 units. Three properties of theirs
+(manual UMAX021211, and read back from the units over SDO) shape the app:
+
+- They only obey valve commands while **OPERATIONAL**. After every power-up or
+  reset they wait in PRE-OPERATIONAL, alive on the bus but ignoring commands,
+  until they receive an NMT "start".
+- They **hold their last command** for as long as they have power. There is no
+  receive timeout configured, so a valve told to open stays open until it is
+  told to close.
+- A command below 300 switches the output off; otherwise the value is the coil
+  current in mA. That is why `290` closes and `370` opens.
+
+So the app listens to the bus as well as talking to it:
+
+- A controller that stops reporting, or announces a restart, is started again
+  automatically. The status bar names any controller that is not responding
+  and its valves are drawn with a dashed red border: they are not under
+  control, whatever was commanded.
+- A controller that restarts three times within 30 s during a run ends the
+  run and blocks Start for 10 s. This means its supply voltage collapses under
+  the load; the log says how many valves were open when it went quiet.
+- Each controller's supply voltage is read every half second during a run and
+  shown in the status bar; a sag below 10.5 V is logged.
+- Fault messages from the controllers (EMCY) are decoded into the log.
+- A valve that a controller still drives 1.5 s after it was told to close is
+  flagged as stuck.
+- On exit every valve is commanded closed and the app waits until the frames
+  have actually left the Pi.
+- Only one copy of the app runs. Starting it again brings the running one to
+  the front and leaves the CAN bus alone.
+
+What the app cannot cover: if the Pi loses power, or the process is killed
+outright, nothing sends "close" and the controllers keep holding. Closing the
+valves in that case needs the receive timeout on the controllers themselves
+(objects 1400h–1402h sub 5) together with a fault value of 0 mA (7341h), which
+defaults to 500 mA, i.e. open.
+
+All of this is logged to `~/.meqal-valve.log` with a `[CAN]` prefix.
+
+## Tests
+
+```bash
+npm test
+```
+
+Runs the real `src/main.js` and `renderer/renderer.js` against a simulated CAN
+bus, five simulated controllers, a simulated power supply and a simulated MQTT
+broker (`test/sim.js`). No hardware and no window are involved, and it takes a
+few seconds.

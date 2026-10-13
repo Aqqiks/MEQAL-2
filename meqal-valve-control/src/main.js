@@ -8,8 +8,10 @@
 //  - The renderer never computes physics. It only sends intent (which valves,
 //    which mode, caps, duration) and renders whatever state the main process
 //    pushes back. This avoids the UI/backend drift the previous version had.
-//  - Native deps (socketcan, mqtt) are OPTIONAL. If they are missing or fail,
-//    the app runs in simulation mode and stays fully usable.
+//  - The app expects real hardware. If the CAN driver (socketcan), the can0
+//    interface or the MQTT library is missing it says so in the status bar and
+//    the log, and Start is refused without a CAN link — it never pretends.
+//    Simulation exists only on request: MEQAL_SIMULATE=1 (npm run sim).
 //  - Three run modes, mutually exclusive:
 //        continuous : every selected valve stays open while running
 //        random     : selected valves toggle open/closed at random intervals
@@ -40,6 +42,16 @@ const fs   = require("fs");
 // compositing is rock-solid on the Pi. Must run before app "ready".
 app.disableHardwareAcceleration();
 
+// Only one copy of the app may drive the valves. A second copy (the desktop
+// icon clicked again) would send its own "all closed" frames ten times a
+// second against the commands of the first one. The second copy exits here,
+// before it touches the CAN bus.
+const isPrimaryInstance = app.requestSingleInstanceLock();
+if (!isPrimaryInstance) {
+  console.warn("[SYSTEM] MEQAL is already running — this second copy is exiting.");
+  app.quit();
+}
+
 // ----------------------------------------------------------------------------
 // CONFIG
 // ----------------------------------------------------------------------------
@@ -55,6 +67,19 @@ const RANDOM_MAX_MS    = 3000;                 // max interval between random to
 const MIN_OPEN_MS      = 400;                  // hardware-safe minimum open time
 const NATURAL_MIN_DL   = 2;                    // natural burst lower bound (dL)
 const NATURAL_MAX_DL   = 5;                    // natural burst upper bound (dL)
+
+// Soft start: how many valves may be newly opened per control tick, per mode.
+// Opening everything in the same instant makes the 12 V supply collapse on
+// this rig — controllers 1, 3 and 4 lose power and restart, every time (seen
+// in the log on 2026-10-08). So valves join a few at a time, spread across the
+// controllers. Closing is never delayed. Normal mode opens all 49 in 2.5 s.
+const OPEN_PER_TICK    = { continuous: 2, natural: 5, random: 5 };
+const START_COOLDOWN_MS = 10000;               // after a protective stop, Start is refused this long
+
+// Set MEQAL_SIMULATE=1 (npm run sim) to run with no hardware at all. Without
+// it the app expects the real CAN bus and says so loudly when it is missing:
+// a run that only exists on screen is worse than no run.
+const SIMULATE         = process.env.MEQAL_SIMULATE === "1" || process.argv.includes("--simulate");
 
 // CAN topology — matches the bench hardware confirmed live on the bus: 5
 // CANopen controllers at node IDs 1..5, each replying with TPDO1/2/3
@@ -81,13 +106,55 @@ const NMT_START_ALL    = Buffer.from([0x01, 0x00, 0x27, 0xF0, 0x00, 0x00, 0x00, 
 const TX_DRAIN_MS      = 4;                    // pop one CAN frame every 4 ms (mcp251x-safe)
 const REFRESH_SWEEP_MS = 100;                  // re-assert every controller this often
 
+// Controller supervision (see CONTROLLER SUPERVISION below). What the
+// controllers send back to us:
+//   TPDO1 0x180+node : output field values 1-4, mA (UInt16LE each)
+//   TPDO2 0x280+node : outputs 5-8
+//   TPDO3 0x380+node : outputs 9-10 (then measured feedback of outputs 1-2)
+//   EMCY  0x080+node : the controller reporting a fault
+//   0x700+node       : boot-up message (data 00) — it has just (re)started
+const TPDO1_BASE       = 0x180;
+const TPDO2_BASE       = 0x280;
+const TPDO3_BASE       = 0x380;
+const EMCY_BASE        = 0x080;
+const BOOTUP_BASE      = 0x700;
+const SUPERVISE_MS     = 250;                  // supervision period
+const NODE_TIMEOUT_MS  = 1000;                 // an OPERATIONAL controller reports every 100 ms; silent this long = not obeying
+const NODE_GRACE_MS    = 1500;                 // after connecting, wait this long before calling a controller offline
+const NMT_RETRY_MS     = 1000;                 // re-send "start" this often while any controller is silent
+const MISMATCH_MS      = 1500;                 // output still driven this long after "close" = stuck
+const TX_FAIL_LIMIT    = 10;                   // consecutive refused frames before the link is declared failing
+const CAN_IFACE        = "can0";               // SocketCAN interface (matches scripts/can-up.sh)
+const CAN_RETRY_MS     = 500;                  // check this often whether a lost interface is back up
+const CAN_DROP_LOG_MS  = 5000;                 // report a lost link at most this often (it may flap)
+const RESTART_WINDOW_MS = 30000;               // a controller restarting RESTART_LIMIT times within this
+const RESTART_LIMIT    = 3;                    //   window while running = it cannot carry the load -> stop
+const CLOSE_ROUNDS     = 5;                    // all-closed sweeps sent on exit (mirrors the reference shutdown)
+const CLOSE_BUDGET_MS  = 800;                  // never let exit hang on a dead bus
+
+// Supply voltage. Each controller measures its own supply (object 5020h, a
+// float in volts). We read it with plain SDO read requests — one controller
+// per poll, round robin — so the log shows what the 12 V rail does under load.
+//   request  0x600+node : 40 20 50 00 ..      answer 0x580+node : 43 20 50 00 <float32>
+const SDO_TX_BASE      = 0x600;
+const SDO_RX_BASE      = 0x580;
+const SUPPLY_READ      = Buffer.from([0x40, 0x20, 0x50, 0x00, 0x00, 0x00, 0x00, 0x00]);
+const SUPPLY_POLL_MS   = 100;                  // poll period while running (each controller every 0.5 s)
+const SUPPLY_IDLE_MS   = 400;                  // poll period while idle (each controller every 2 s)
+const SUPPLY_STALE_MS  = 3000;                 // a reading older than this is not shown
+const SUPPLY_LOW_V     = 10.5;                 // warn when a controller's supply sags below this in a run
+
 // "random" mode is driven by the external Python script, which decides the
 // open/closed valve set from the per-valve CSV timing profile and prints it on
 // stdout. main.js spawns it, reads that set, and drives the CAN bus + MQTT from
 // it (the script no longer talks to CAN/MQTT itself). It is a single ~5s run
 // (its own RUN_DURATION): one run per Random activation, then main.js goes idle.
 // Stop / Emergency / toggling the mode off kill it early.
-const PY_SCRIPT_DIR    = path.join(__dirname, "..", "scripts");
+// In a packaged build the scripts sit outside the archive (extraResources) so
+// that python3 can read them.
+const PY_SCRIPT_DIR    = app.isPackaged
+  ? path.join(process.resourcesPath, "scripts")
+  : path.join(__dirname, "..", "scripts");
 const PY_SCRIPT        = path.join(PY_SCRIPT_DIR, "venttiiliohjaus.py");
 const PY_MIN_RUN_MS    = 1000;                 // a faster exit than this = launch failure (just warn)
 
@@ -118,36 +185,98 @@ let canTxTimer            = null;   // drains the paced TX queue
 let autoStopTimer         = null;
 let connectionHealTimer   = null;
 let mqttClient            = null;
+let mqttError             = null;   // why MQTT is not publishing, or null
+let mqttWasConnected      = false;
 let canBus                = null;
-let canSimulated          = true;
+let canSimulated          = SIMULATE; // true only when simulation was asked for
+let canError              = null;   // why there is no CAN link: { label, detail } or null
 let canTxQueue            = [];      // [{ id, data }] paced out one-per-tick
+let canSuperviseTimer     = null;   // controller supervision
+let canSupplyTimer        = null;   // supply-voltage polling
+let canRetryTimer         = null;   // reopens can0 after it was lost
+let canLost               = false;  // hardware present but no usable link; waiting for it
+let canEverUp             = false;  // a working link has existed in this session
+let canDropLoggedAt       = 0;      // last time a lost link was reported
+let canModuleMissing      = false;  // the socketcan driver could not be loaded
+let canWarned             = false;  // "not available" already logged
+let supplyPollNext        = 1;      // controller to ask next
+let lastSupplyPollAt      = 0;
+let energized             = new Set(); // valves we are commanding open right now (soft start lets them join gradually)
+let startBlockedUntil     = 0;      // Start is refused until this time (after a protective stop)
+let startBlockReason      = "";
+let loadHistory           = [];     // [{ t, total, per: [..] }] valves commanded open, one entry per tick (last 5 s)
+let canConnectedAt        = 0;      // when the current link was opened
+let canTxOk               = true;   // is the kernel accepting our frames?
+let canTxFails            = 0;      // consecutive refused frames
+let lastNmtAt             = 0;      // last NMT "start" we sent
+let lastSuperviseAt       = 0;      // last supervision pass (detects a stalled event loop)
+let shuttingDown          = false;  // exit in progress
 let pythonProc            = null;    // running venttiiliohjaus.py child, or null
 let pythonOpenSet         = new Set(); // open valve ids (1-indexed) the script last reported
 
+// One entry per controller node (index 1..NUM_CONTROLLERS).
+const CTRL = Array.from({ length: NUM_CONTROLLERS + 1 }, () => ({
+  status:   "unknown",                          // "unknown" | "online" | "offline"
+  lastSeen: 0,                                  // time of its last TPDO
+  wasOnline: false,                             // has been operational on this link
+  boots:    0,                                  // boot-up messages seen since launch
+  restarts: [],                                 // recent restart times (restart guard)
+  fv:       new Array(VALVES_PER_CTRL).fill(0), // output it reports driving, mA per output
+  supplyV:  null,                               // its last supply-voltage reading (volts)
+  supplyAt: 0,                                  // when that reading arrived
+  runMinV:  null,                               // lowest reading during the current run
+  lowWarned: false,                             // sag already reported in this run
+  faultOutputs: new Set(),                      // outputs it has reported faults on, not yet logged
+  faultTimer: null,
+}));
+const commanded     = new Array(VALVE_COUNT + 1).fill(false); // what each valve was last told (true = open)
+const mismatchSince = new Array(VALVE_COUNT + 1).fill(0);     // when a valve was first seen driven while told to close
+let   stuckOpen     = new Set();                              // valves still driven after MISMATCH_MS
+
 // ============================================================================
-// MQTT (optional)
+// MQTT — valve state and flow are published to the broker on this Pi
+// ----------------------------------------------------------------------------
+// The client reconnects by itself every 5 s, so a broker that starts late or
+// restarts is picked up without restarting the app. Whether we are publishing
+// is shown in the status bar: a run nobody recorded should not be a surprise.
 // ============================================================================
 function setupMqtt() {
+  if (mqttClient) return;
   let mqtt;
   try {
     mqtt = require("mqtt");
   } catch (e) {
-    console.warn("[MQTT] Module not installed — skipping MQTT mirror.");
+    if (!mqttError) console.warn("[MQTT] The mqtt library could not be loaded:", firstLine(e), "— nothing will be published. Fix with: npm run setup");
+    mqttError = "MQTT library not installed (npm run setup)";
     return;
   }
   try {
-    mqttClient = mqtt.connect("mqtt://localhost:1883", { connectTimeout: 3000, reconnectPeriod: 0 });
-    mqttClient.on("connect", () => console.log("[MQTT] Connected"));
+    mqttError  = "MQTT broker not reachable on localhost:1883";
+    mqttClient = mqtt.connect("mqtt://localhost:1883", { connectTimeout: 3000, reconnectPeriod: 5000 });
+    mqttClient.on("connect", () => {
+      console.log("[MQTT] Connected");
+      mqttError = null;
+      pushStateToRenderer(mqttWasConnected ? { notice: "MQTT is back — publishing again" } : {});
+      mqttWasConnected = true;
+    });
+    mqttClient.on("close", () => {
+      if (mqttError) return;                   // already known to be down
+      mqttError = "MQTT broker not reachable on localhost:1883";
+      console.warn("[MQTT] Connection lost — retrying every 5 s. Nothing is published meanwhile.");
+      pushStateToRenderer({ notice: "MQTT connection lost — this run is not being published", notice_error: true });
+    });
     mqttClient.on("error", (err) => {
-      console.warn("[MQTT] Not available:", err.message);
-      try { mqttClient.end(true); } catch (_) {}
-      mqttClient = null;
+      if (!mqttError || mqttWasConnected) return;
+      if (!mqttClient.meqalWarned) console.warn("[MQTT] Not available:", err.message, "— retrying every 5 s");
+      mqttClient.meqalWarned = true;
     });
   } catch (e) {
     console.warn("[MQTT] Connect failed:", e.message);
     mqttClient = null;
   }
 }
+
+function firstLine(e) { return String((e && e.message) || e).split("\n")[0]; }
 
 function publishFlow(flowInc) {
   if (!mqttClient || !mqttClient.connected) return;
@@ -160,7 +289,7 @@ function publishState(states) {
 }
 
 // ============================================================================
-// CAN BUS (optional, Linux/socketcan) — falls back to simulation
+// CAN BUS (Linux/socketcan)
 // ----------------------------------------------------------------------------
 // All TX goes through a small paced queue (one frame every TX_DRAIN_MS). The
 // Raspberry Pi's mcp251x has only a few hardware TX buffers; blasting all 13
@@ -206,20 +335,43 @@ function txEnqueue(id, data) {
   canTxQueue.push({ id, data });
 }
 
-// Pop and send exactly one frame. Driven by canTxTimer every TX_DRAIN_MS.
-function txDrain() {
-  if (!canBus || canTxQueue.length === 0) return;
-  const f = canTxQueue.shift();
+// Hand one frame to the kernel; true if it was accepted. socketcan's send()
+// does NOT throw when a frame is refused (queue full, link down, nobody on the
+// bus acknowledging) — it returns the syscall result, negative on failure.
+// Ignoring that return value is how frames used to vanish without a trace.
+function sendNow(f) {
   try {
-    canBus.send({ id: f.id, data: f.data, ext: false, rtr: false });
-  } catch (e) {
-    // ENOBUFS etc. — drop this frame; the next sweep re-asserts state anyway.
-    console.warn("[CAN] TX dropped:", e.message);
+    const rc = canBus.send({ id: f.id, data: f.data, ext: false, rtr: false });
+    return !(typeof rc === "number" && rc < 0);
+  } catch (_) {
+    return false;
   }
 }
 
-// Queue a full refresh of every controller (all 3 RPDOs each) for the open set.
+// Pop and send exactly one frame. Driven by canTxTimer every TX_DRAIN_MS. A
+// refused frame is dropped (the next sweep re-asserts the full state anyway),
+// but a run of refusals means nothing is reaching the controllers — say so.
+function txDrain() {
+  if (!canBus || canTxQueue.length === 0) return;
+  if (sendNow(canTxQueue.shift())) {
+    canTxFails = 0;
+    if (!canTxOk) {
+      canTxOk = true;
+      console.log("[CAN] Transmit recovered");
+      pushStateToRenderer({ notice: "CAN transmit recovered" });
+    }
+  } else if (++canTxFails === TX_FAIL_LIMIT) {
+    canTxOk = false;
+    console.warn("[CAN] Transmit FAILING — frames are not leaving the Pi (controllers unpowered, cable/termination, or can0 down). Valves are NOT under control.");
+    pushStateToRenderer({ notice: "CAN transmit failing — valves are not under control", notice_error: true });
+  }
+}
+
+// Queue a full refresh of every controller (all 3 RPDOs each) for the open
+// set, and remember what each valve was told so supervision can compare it
+// with what the controller reports back.
 function enqueueSweep(openSet) {
+  for (let v = 1; v <= VALVE_COUNT; v++) commanded[v] = openSet.has(v);
   for (let ctrl = 1; ctrl <= NUM_CONTROLLERS; ctrl++) {
     for (const f of buildCtrlFrames(ctrl, openSet)) txEnqueue(f.id, f.data);
   }
@@ -234,46 +386,507 @@ function sendAllClosed(rounds = 1) {
   for (let r = 0; r < rounds; r++) enqueueSweep(new Set());
 }
 
+// Blocking sleep, used only on the way out when the paced drain timer is gone.
+const SLEEP_CELL = new Int32Array(new SharedArrayBuffer(4));
+function sleepSync(ms) {
+  try {
+    Atomics.wait(SLEEP_CELL, 0, 0, ms);
+  } catch (_) {
+    const end = Date.now() + ms;
+    while (Date.now() < end) { /* spin */ }
+  }
+}
+
+// Exit path: command every valve closed and make sure the kernel really took
+// each frame. The Pi's CAN transmit queue holds only about a dozen frames, so
+// writing all CLOSE_ROUNDS sweeps back-to-back (as this used to) gets most of
+// them refused — the later controllers never heard "close" and, since they
+// hold their last command, their valves stayed open after the app was gone.
+// Here a refused frame is retried once the bus has made room. Returns false
+// if the bus would not take the frames within CLOSE_BUDGET_MS.
+function closeAllValvesBlocking() {
+  const deadline = Date.now() + CLOSE_BUDGET_MS;
+  const nothingOpen = new Set();
+  canTxQueue = [];
+  for (let r = 0; r < CLOSE_ROUNDS; r++) {
+    for (let ctrl = 1; ctrl <= NUM_CONTROLLERS; ctrl++) {
+      for (const f of buildCtrlFrames(ctrl, nothingOpen)) {
+        while (!sendNow(f)) {
+          if (Date.now() >= deadline) return false;
+          sleepSync(1);
+        }
+      }
+    }
+  }
+  sleepSync(40); // let the frames still queued in the kernel reach the wire
+  return true;
+}
+
+// Is the interface administratively up? "up" | "down" | null (no such
+// interface). A socket bound to an interface that is DOWN is born with an
+// error pending (the kernel flags ENETDOWN at bind), which makes the
+// library's receive thread quit at once — so we wait for the link to be up
+// instead of opening sockets that die immediately.
+function canIfaceState() {
+  try {
+    const flags = parseInt(fs.readFileSync(`/sys/class/net/${CAN_IFACE}/flags`, "utf8"), 16);
+    return (flags & 0x1) ? "up" : "down";
+  } catch (_) {
+    return null;
+  }
+}
+
+// Hardware mode without a usable link ("NO CAN"): keep trying until the
+// interface is up and opens. Used when a working link drops, and when the
+// interface exists but is still down at launch. setupCan() stays quiet and
+// opens nothing while the interface is down or gone.
+function waitForCan() {
+  canLost = true;
+  if (canRetryTimer) return;
+  canRetryTimer = setInterval(() => {
+    setupCan();
+    if (canBus) { clearInterval(canRetryTimer); canRetryTimer = null; }
+  }, CAN_RETRY_MS);
+}
+
 function setupCan() {
+  if (canBus || shuttingDown) return;
+  if (SIMULATE) {
+    if (!canWarned) console.warn("[CAN] SIMULATION requested (MEQAL_SIMULATE=1) — the CAN bus is not used, no valve will move.");
+    canWarned = true;
+    return;
+  }
   let can;
   try {
     can = require("socketcan");
   } catch (e) {
-    console.warn("[CAN] socketcan not installed — running in SIMULATION mode.");
-    canBus = null; canSimulated = true;
+    // Not installed, or built for a different Node/Electron version. Either
+    // way no valve can be driven; say exactly that instead of pretending.
+    if (!canModuleMissing) {
+      console.error("[CAN] The socketcan driver could not be loaded:", firstLine(e));
+      console.error("[CAN] VALVES CANNOT BE CONTROLLED. Fix with: npm run setup   (then restart the app)");
+    }
+    canModuleMissing = true;
+    canBus   = null;
+    canError = { label: "CAN DRIVER MISSING", detail: "The CAN driver (socketcan) is not installed for this app. Run `npm run setup` in the app folder, then restart." };
     return;
   }
+  const iface = canIfaceState();
+  if (iface !== "up") {
+    if (!canLost) {
+      console.warn(iface === "down"
+        ? `[CAN] ${CAN_IFACE} exists but is DOWN — waiting for it to come up (scripts/can-up.sh brings it up).`
+        : `[CAN] ${CAN_IFACE} does not exist — is the CAN board connected and enabled? Waiting for it.`);
+    }
+    canError = iface === "down"
+      ? { label: "can0 IS DOWN", detail: "The CAN interface exists but is down. Run scripts/can-up.sh (the desktop launcher does this)." }
+      : { label: "NO can0", detail: "The CAN interface can0 was not found. Check the CAN board and /boot/firmware/config.txt." };
+    waitForCan();
+    return;
+  }
+  let chan;
   try {
-    canBus = can.createRawChannel("can0", true);
-    canBus.start();
-    canSimulated = false;
-    canTxQueue   = [];
-    console.log("[CAN] Connected to can0");
-
-    // Start the paced drain first so anything we enqueue actually goes out.
-    if (canTxTimer) clearInterval(canTxTimer);
-    canTxTimer = setInterval(txDrain, TX_DRAIN_MS);
-
-    // NMT: move every CANopen node Pre-Operational -> Operational. Send a few
-    // times in case a node was still powering up when the first frame went out.
-    for (let i = 0; i < 3; i++) txEnqueue(NMT_ID, NMT_START_ALL);
-
-    // While running, the control loop drives CAN in phase with the physics.
-    // While idle, re-assert all-closed here so valves are actively held shut
-    // and a dropped frame can never leave one stuck open.
-    if (canRefreshTimer) clearInterval(canRefreshTimer);
-    canRefreshTimer = setInterval(() => {
-      if (!STATE.running) enqueueSweep(new Set());
-    }, REFRESH_SWEEP_MS);
+    chan = can.createRawChannel(CAN_IFACE, true);
+    chan.addListener("onMessage", onCanMessage);
+    chan.addListener("onStopped", () => onCanStopped(chan));
+    chan.start();
   } catch (e) {
-    console.warn("[CAN] Not available:", e.message, "— running in SIMULATION mode.");
-    canBus = null; canSimulated = true;
+    if (!canWarned) console.warn(`[CAN] Could not open ${CAN_IFACE}:`, firstLine(e), "— retrying.");
+    canWarned = true;
+    canBus    = null;
+    canError  = { label: "CAN NOT OPEN", detail: `Could not open ${CAN_IFACE}: ${firstLine(e)}` };
+    waitForCan();
+    return;
+  }
+
+  const firstLink = !canEverUp;
+  canEverUp      = true;
+  canBus         = chan;
+  canError       = null;
+  canLost        = false;
+  canWarned      = false;
+  canTxQueue     = [];
+  canTxOk        = true;
+  canTxFails     = 0;
+  canConnectedAt = Date.now();
+  lastSuperviseAt = canConnectedAt;
+  stuckOpen      = new Set();
+  commanded.fill(false);
+  mismatchSince.fill(0);
+  for (let n = 1; n <= NUM_CONTROLLERS; n++) {
+    const c = CTRL[n];
+    c.status = "unknown"; c.lastSeen = 0; c.wasOnline = false; c.restarts = []; c.fv.fill(0);
+    c.supplyV = null; c.supplyAt = 0;
+  }
+  console.log(`[CAN] Connected to ${CAN_IFACE}`);
+
+  // Start the paced drain first so anything we enqueue actually goes out.
+  if (canTxTimer) clearInterval(canTxTimer);
+  canTxTimer = setInterval(txDrain, TX_DRAIN_MS);
+
+  // NMT: move every CANopen node Pre-Operational -> Operational. Send a few
+  // times in case a node was still powering up when the first frame went out.
+  // Supervision repeats it later for any controller that stays silent.
+  for (let i = 0; i < 3; i++) sendNmtStart();
+
+  // While running, the control loop drives CAN in phase with the physics.
+  // While idle, re-assert all-closed here so valves are actively held shut
+  // and a dropped frame can never leave one stuck open.
+  if (canRefreshTimer) clearInterval(canRefreshTimer);
+  canRefreshTimer = setInterval(() => {
+    if (!STATE.running) enqueueSweep(new Set());
+  }, REFRESH_SWEEP_MS);
+
+  if (canSuperviseTimer) clearInterval(canSuperviseTimer);
+  canSuperviseTimer = setInterval(superviseControllers, SUPERVISE_MS);
+
+  if (canSupplyTimer) clearInterval(canSupplyTimer);
+  canSupplyTimer = setInterval(pollSupply, SUPPLY_POLL_MS);
+
+  // The first time a link comes alive nothing may already be "running" (Start
+  // is refused without a link, but keep the guarantee here too): a run must
+  // never turn into real open valves by itself.
+  if (firstLink && STATE.running) {
+    doStop();
+    console.warn("[SYSTEM] CAN came up during a run that had no hardware — STOPPED. Press Start to run on the real valves.");
+    pushStateToRenderer({ notice: "CAN connected — run stopped. Press Start to run on the real valves.", notice_error: true });
+    return;
+  }
+  pushStateToRenderer();
+}
+
+// can0 went away under us (`ip link set can0 down`, adapter unplugged). The
+// library's receive thread is gone, so this channel is finished: drop it and
+// open a fresh one as soon as the interface is back up. The controllers hold
+// their last command meanwhile, so getting back quickly matters most here.
+function onCanStopped(chan) {
+  if (chan !== canBus || shuttingDown) return; // an old channel, or our own stop()
+  if (canTxTimer)        { clearInterval(canTxTimer);        canTxTimer = null; }
+  if (canRefreshTimer)   { clearInterval(canRefreshTimer);   canRefreshTimer = null; }
+  if (canSuperviseTimer) { clearInterval(canSuperviseTimer); canSuperviseTimer = null; }
+  if (canSupplyTimer)    { clearInterval(canSupplyTimer);    canSupplyTimer = null; }
+  canBus     = null;
+  canError   = { label: "NO CAN", detail: `The CAN link (${CAN_IFACE}) went down. Valves hold their last command until it is back.` };
+  canTxQueue = [];
+  stuckOpen  = new Set();
+  waitForCan();
+
+  // One message per outage, however often the link flaps.
+  const now = Date.now();
+  if (now - canDropLoggedAt < CAN_DROP_LOG_MS) { pushStateToRenderer(); return; }
+  canDropLoggedAt = now;
+  console.warn(`[CAN] ${CAN_IFACE} went down — valves hold their last command until the link is back. Waiting for it…`);
+  pushStateToRenderer({ notice: "CAN link lost — valves hold their last command", notice_error: true });
+}
+
+// MQTT reconnects by itself and a missing CAN link is retried by waitForCan();
+// this only covers an MQTT client that could not be created at all.
+function healConnections() {
+  if (!mqttClient) setupMqtt();
+}
+
+// ============================================================================
+// CONTROLLER SUPERVISION
+// ----------------------------------------------------------------------------
+// The valve controllers (Axiomatic AX021211) only obey valve commands while
+// OPERATIONAL. After every power-up or reset they wait in PRE-OPERATIONAL —
+// alive on the bus but ignoring commands — until an NMT "start" arrives, and
+// they keep doing whatever they were last told for as long as they have power.
+// Sending "start" once at launch is therefore not enough: a controller that
+// powered up late, or reset under load, used to stay dead until the app was
+// restarted, while the UI happily showed its valves as open. So we listen:
+//   - an OPERATIONAL controller reports its outputs every 100 ms (TPDO1/2/3);
+//     silence means it is not obeying -> re-send "start" until it answers.
+//   - a boot-up message means it has just restarted -> start it right away.
+//   - an EMCY message is the controller itself reporting a fault -> log it.
+// The reported output values are also compared with what we commanded, so a
+// valve that is still being driven after it was told to close gets flagged.
+// ============================================================================
+
+function ctrlOf(vid) { return Math.floor((vid - 1) / VALVES_PER_CTRL) + 1; }
+
+function ctrlValves(n) {
+  return `${(n - 1) * VALVES_PER_CTRL + 1}-${Math.min(n * VALVES_PER_CTRL, VALVE_COUNT)}`;
+}
+
+function sendNmtStart() {
+  lastNmtAt = Date.now();
+  txEnqueue(NMT_ID, NMT_START_ALL);
+}
+
+// Controllers confirmed not responding (empty while simulating / disconnected).
+function offlineControllers() {
+  const out = [];
+  if (!canBus) return out;
+  for (let n = 1; n <= NUM_CONTROLLERS; n++) if (CTRL[n].status === "offline") out.push(n);
+  return out;
+}
+
+// Every frame received from the bus. An exception escaping a socketcan
+// listener is fatal to the whole process, so nothing may throw out of here.
+function onCanMessage(msg) {
+  try {
+    if (!msg || msg.ext || msg.rtr || msg.err || !msg.data) return;
+    const node = msg.id & 0x7F;
+    if (node < 1 || node > NUM_CONTROLLERS) return;
+    const fn = msg.id & 0x780;
+    const d  = msg.data;
+
+    if (fn === TPDO1_BASE || fn === TPDO2_BASE || fn === TPDO3_BASE) {
+      const first = fn === TPDO1_BASE ? 0 : fn === TPDO2_BASE ? 4 : 8;
+      const count = fn === TPDO3_BASE ? 2 : 4;
+      const fv    = CTRL[node].fv;
+      for (let k = 0; k < count && k * 2 + 1 < d.length; k++) fv[first + k] = d.readInt16LE(k * 2);
+      controllerSeen(node);
+    } else if (fn === BOOTUP_BASE) {
+      if (d.length >= 1 && d[0] === 0x00) controllerBooted(node);
+    } else if (fn === EMCY_BASE) {
+      controllerEmergency(node, d);
+    } else if (fn === SDO_RX_BASE) {
+      // Answer to our supply-voltage read: 43 20 50 00 <float32 LE, volts>.
+      // An expedited answer may or may not state its size (43 or 42): take both.
+      const expedited = (d[0] & 0xE0) === 0x40 && (d[0] & 0x02) !== 0;
+      const fourBytes = (d[0] & 0x01) === 0 || ((d[0] >> 2) & 0x03) === 0;
+      if (d.length >= 8 && expedited && fourBytes && d[1] === SUPPLY_READ[1] && d[2] === SUPPLY_READ[2] && d[3] === 0x00) {
+        supplyReading(node, d.readFloatLE(4));
+      }
+    }
+  } catch (e) {
+    console.warn("[CAN] RX handler error:", e.message);
   }
 }
 
-function healConnections() {
-  if (!mqttClient) setupMqtt();
-  if (!canBus && !canSimulated) setupCan();
+// Ask one controller for its supply voltage. Read-only, one small request per
+// poll, sent through the same paced queue as everything else.
+function pollSupply() {
+  if (!canBus) return;
+  const now = Date.now();
+  if (!STATE.running && now - lastSupplyPollAt < SUPPLY_IDLE_MS) return;
+  lastSupplyPollAt = now;
+  txEnqueue(SDO_TX_BASE + supplyPollNext, SUPPLY_READ);
+  supplyPollNext = supplyPollNext % NUM_CONTROLLERS + 1;
+}
+
+function supplyReading(n, volts) {
+  if (!Number.isFinite(volts) || volts < 0 || volts > 100) return;
+  const c = CTRL[n];
+  c.supplyV  = volts;
+  c.supplyAt = Date.now();
+  if (!STATE.running) return;
+  if (c.runMinV == null || volts < c.runMinV) c.runMinV = volts;
+  if (volts < SUPPLY_LOW_V && !c.lowWarned) {
+    c.lowWarned = true;
+    console.warn(`[POWER] Controller ${n} supply is sagging: ${volts.toFixed(1)} V with ${energized.size} valves open (${energizedOn(n)} on this controller)`);
+    pushStateToRenderer({ notice: `Controller ${n} supply sagging: ${volts.toFixed(1)} V with ${energized.size} valves open`, notice_error: true });
+  }
+}
+
+// Latest fresh reading per controller, for the UI (null = no recent answer).
+function supplyVolts() {
+  const now = Date.now();
+  return CTRL.slice(1).map(c => (canBus && c.supplyV != null && now - c.supplyAt < SUPPLY_STALE_MS)
+    ? Math.round(c.supplyV * 10) / 10 : null);
+}
+
+function energizedOn(n) {
+  let k = 0;
+  for (const v of energized) if (ctrlOf(v) === n) k++;
+  return k;
+}
+
+// One line saying what the supply did during the run that just ended.
+function logRunPower(reason) {
+  const parts = [];
+  for (let n = 1; n <= NUM_CONTROLLERS; n++) {
+    if (CTRL[n].runMinV != null) parts.push(`c${n} ${CTRL[n].runMinV.toFixed(1)} V`);
+  }
+  if (parts.length) console.log(`[POWER] ${reason}: lowest supply seen during the run — ${parts.join(", ")}`);
+}
+
+function controllerSeen(n) {
+  const c = CTRL[n];
+  c.lastSeen = Date.now();
+  if (c.status === "online") return;
+  const wasOffline = c.status === "offline";
+  c.status    = "online";
+  c.wasOnline = true;
+  console.log(`[CAN] Controller ${n} operational (valves ${ctrlValves(n)})`);
+  pushStateToRenderer(wasOffline ? { notice: `Controller ${n} is back — valves ${ctrlValves(n)} under control` } : {});
+}
+
+// A controller announced that it has just (re)started. It is PRE-OPERATIONAL
+// and its outputs are off; start it now rather than waiting for the timeout.
+function controllerBooted(n) {
+  const c   = CTRL[n];
+  const now = Date.now();
+  c.boots++;
+  c.fv.fill(0);
+  sendNmtStart();
+
+  if (!c.wasOnline) {                      // first power-up since we connected: nothing was lost
+    console.log(`[CAN] Controller ${n} booted — starting it`);
+    return;
+  }
+  c.status   = "offline";
+  c.restarts = c.restarts.filter(t => now - t < RESTART_WINDOW_MS);
+  c.restarts.push(now);
+
+  // What was going on when it lost power: this is the evidence for sizing the
+  // supply, so put all of it in the log.
+  const was  = loadWhenLastHeard(n);
+  const load = was && was.total > 0 ? ` It went quiet with ${was.total} valves open (${was.here} on this controller).` : "";
+  const volts = c.supplyV != null && now - c.supplyAt < SUPPLY_STALE_MS + 2000
+    ? ` Its supply last read ${c.supplyV.toFixed(1)} V.` : "";
+  console.warn(`[CAN] Controller ${n} restarted (boot-up message #${c.boots}).${load}${volts} Its valves ${ctrlValves(n)} dropped; starting it again.`);
+
+  // Restarting again and again while we are driving valves means the
+  // controller cannot carry the load (the supply voltage collapsing when the
+  // coils switch on). Its valves come back gradually (soft start), but if it
+  // still falls over, end the run and refuse Start for a while: on 2026-10-08
+  // repeated Starts put the controllers through a thousand such restarts.
+  if (STATE.running && c.restarts.length >= RESTART_LIMIT) {
+    const open = was ? was.total : energized.size;
+    doStop();
+    startBlockedUntil = now + START_COOLDOWN_MS;
+    startBlockReason  = `controller ${n} keeps losing power when its valves open`;
+    console.warn(`[SYSTEM] Controller ${n} restarted ${c.restarts.length} times in ${RESTART_WINDOW_MS / 1000}s while running — STOPPED with ${open} valves open. The 12 V supply (or its wiring) cannot carry this many valves. Start is blocked for ${START_COOLDOWN_MS / 1000} s.`);
+    logRunPower("stopped");
+    pushStateToRenderer({ notice: `Stopped: controller ${n} keeps losing power under load (${open} valves were open). Check the 12 V supply.`, notice_error: true });
+    return;
+  }
+  pushStateToRenderer({ notice: `Controller ${n} restarted — valves ${ctrlValves(n)} dropped`, notice_error: true });
+}
+
+// EMCY: bytes 0-1 error code (LE), byte 2 error register, bytes 3-7 device
+// specific. Layout confirmed against real frames from this rig (2026-10-08):
+//   02 f0 01 10 10 00 00 00  = code F002, output 1   (byte 3 = output << 4,
+//   02 f0 01 a0 10 00 00 00  = code F002, output 10   byte 4 = 10h "open circuit")
+// The raw bytes are always logged as well.
+const EMCY_TEXT = {
+  0x3000: "supply voltage out of range",
+  0x8100: "valve commands timed out",
+  0x8130: "heartbeat lost",
+  0x8140: "recovered from bus-off",
+};
+const EMCY_OUTPUT_FAULT = 0xF002;
+const EMCY_COLLECT_MS   = 300;                 // a controller reports its outputs one frame each: gather them
+
+function controllerEmergency(n, d) {
+  if (d.length < 3) return;
+  const c    = CTRL[n];
+  const code = d.readUInt16LE(0);
+  const raw  = d.toString("hex");
+
+  if (code === 0x0000) {
+    // "One error gone". Only worth a line when the error register says none are left.
+    if (d[2] === 0) console.log(`[CAN] Controller ${n}: all faults cleared`);
+    return;
+  }
+
+  if (code === EMCY_OUTPUT_FAULT && d.length >= 4) {
+    // The controller could not drive the commanded current through this
+    // output: measured current more than 100 mA off target for over a second.
+    const b = d[3];
+    const output = (b & 0x0F) === 0 && b !== 0 ? b >> 4 : b;
+    if (output >= 1 && output <= VALVES_PER_CTRL) {
+      c.faultOutputs.add(output);
+      if (!c.faultTimer) c.faultTimer = setTimeout(() => flushOutputFaults(n), EMCY_COLLECT_MS);
+      return;
+    }
+  }
+
+  let detail = EMCY_TEXT[code] || "unknown fault";
+  if (code === 0x3000 && d.length >= 5) detail += d[4] === 0x40 ? " (UNDERVOLTAGE)" : d[4] === 0x20 ? " (overvoltage)" : "";
+  console.warn(`[CAN] Controller ${n} reports a fault: ${detail} [EMCY 0x${code.toString(16).padStart(4, "0")}, raw ${raw}]`);
+  pushStateToRenderer({ notice: `Controller ${n} fault: ${detail}`, notice_error: true });
+}
+
+// One line for all the outputs a controller has just complained about.
+function flushOutputFaults(n) {
+  const c = CTRL[n];
+  c.faultTimer = null;
+  const outs = Array.from(c.faultOutputs).sort((a, b) => a - b);
+  c.faultOutputs.clear();
+  if (!outs.length) return;
+  const valves = outs.map(o => (n - 1) * VALVES_PER_CTRL + o).filter(v => v <= VALVE_COUNT);
+  const volts  = c.supplyV != null && Date.now() - c.supplyAt < SUPPLY_STALE_MS ? ` Its supply reads ${c.supplyV.toFixed(1)} V.` : "";
+  const many   = outs.length >= 3;
+  console.warn(`[CAN] Controller ${n} could not drive the commanded current on output${outs.length > 1 ? "s" : ""} ${outs.join(", ")} (valve${valves.length > 1 ? "s" : ""} ${valves.join(", ")}) — ${many ? "supply voltage too low for the load" : "coil disconnected or shorted, or supply voltage too low"}.${volts}`);
+  pushStateToRenderer({
+    notice: many
+      ? `Controller ${n}: cannot reach valve current on ${outs.length} outputs — supply voltage too low`
+      : `Controller ${n}: valve ${valves.join(", ")} not drawing current — check the coil and wiring`,
+    notice_error: true,
+  });
+}
+
+// Runs every SUPERVISE_MS while a CAN link is open.
+function superviseControllers() {
+  if (!canBus) return;
+  const now = Date.now();
+  // If this pass itself ran late, the event loop was blocked and the frames
+  // received meanwhile have not been handled yet: silence proves nothing.
+  const stalled = now - lastSuperviseAt > 2 * SUPERVISE_MS;
+  lastSuperviseAt = now;
+  if (stalled) return;
+
+  const lost = [];
+  let anyDown = false;
+
+  for (let n = 1; n <= NUM_CONTROLLERS; n++) {
+    const c = CTRL[n];
+    if (c.status === "online" && now - c.lastSeen > NODE_TIMEOUT_MS) {
+      c.status = "offline";
+      c.fv.fill(0);
+      lost.push(n);
+      const was  = loadWhenLastHeard(n);
+      const load = was && was.total > 0 ? ` (it went quiet with ${was.total} valves open, ${was.here} on this controller)` : "";
+      console.warn(`[CAN] Controller ${n} stopped responding — valves ${ctrlValves(n)} are NOT under control${load}`);
+    } else if (c.status === "unknown" && now - canConnectedAt > NODE_GRACE_MS) {
+      c.status = "offline";
+      lost.push(n);
+      console.warn(`[CAN] Controller ${n} is not responding — valves ${ctrlValves(n)} are NOT under control (unpowered, unplugged, or not started)`);
+    }
+    if (c.status !== "online") anyDown = true;
+  }
+
+  // Keep knocking: a silent controller is most likely just PRE-OPERATIONAL.
+  if (anyDown && now - lastNmtAt >= NMT_RETRY_MS) sendNmtStart();
+
+  const stuckChanged = checkStuckValves(now);
+  if (lost.length) {
+    pushStateToRenderer({ notice: `Controller ${lost.join(", ")} not responding — valves not under control`, notice_error: true });
+  } else if (stuckChanged) {
+    pushStateToRenderer(stuckOpen.size
+      ? { notice: `Valve ${Array.from(stuckOpen).join(", ")} still driven although commanded closed`, notice_error: true }
+      : {});
+  }
+}
+
+// A valve the controller keeps driving for MISMATCH_MS after it was told to
+// close. Returns true when the set of such valves changed.
+function checkStuckValves(now) {
+  const stuck = new Set();
+  for (let v = 1; v <= VALVE_COUNT; v++) {
+    const c  = CTRL[ctrlOf(v)];
+    const mA = c.fv[(v - 1) % VALVES_PER_CTRL];
+    if (commanded[v] || c.status !== "online" || mA <= 0) { mismatchSince[v] = 0; continue; }
+    if (!mismatchSince[v]) mismatchSince[v] = now;
+    if (now - mismatchSince[v] >= MISMATCH_MS) stuck.add(v);
+  }
+  let changed = false;
+  for (const v of stuck) {
+    if (stuckOpen.has(v)) continue;
+    changed = true;
+    console.warn(`[CAN] Valve ${v} is commanded CLOSED but controller ${ctrlOf(v)} still reports it driven (${CTRL[ctrlOf(v)].fv[(v - 1) % VALVES_PER_CTRL]} mA)`);
+  }
+  for (const v of stuckOpen) {
+    if (stuck.has(v)) continue;
+    changed = true;
+    console.log(`[CAN] Valve ${v} is no longer driven`);
+  }
+  stuckOpen = stuck;
+  return changed;
 }
 
 // ============================================================================
@@ -426,9 +1039,11 @@ function controlLoopTick() {
   // toggling here. natural still runs its in-process pulse state machine.
   if (STATE.mode === "natural") tickNaturalCloseReopen(now);
 
-  const openSet = openValveSet();
+  // What the mode wants open, rationed into what we actually command open.
+  rationOpenings(openValveSet(), now);
+  recordLoad(now);
 
-  for (const vid of openSet) {
+  for (const vid of energized) {
     if (STATE.limitedValves.has(vid)) continue;
 
     let add = perTick;
@@ -483,6 +1098,56 @@ function controlLoopTick() {
   pushStateToRenderer();
 }
 
+// Soft start. `want` is what the mode asks to be open; `energized` is what we
+// actually command open. A valve leaves at once. Valves join at most
+// OPEN_PER_TICK per tick, in an order that spreads them across the
+// controllers, and only on controllers that are answering — so a controller
+// that has just restarted gets its valves back a few at a time instead of all
+// ten in one step (which is what knocked it over again and again).
+function rationOpenings(want, now) {
+  for (const v of energized) {
+    if (!want.has(v) || STATE.limitedValves.has(v) || !ctrlUsable(ctrlOf(v))) energized.delete(v);
+  }
+  const waiting = [];
+  for (const v of want) {
+    if (!energized.has(v) && !STATE.limitedValves.has(v) && ctrlUsable(ctrlOf(v))) waiting.push(v);
+  }
+  if (!waiting.length) return;
+  waiting.sort((a, b) => joinOrder(a) - joinOrder(b));
+  const budget = OPEN_PER_TICK[STATE.mode] || OPEN_PER_TICK.continuous;
+  for (const v of waiting.slice(0, budget)) {
+    energized.add(v);
+    const nat = STATE.mode === "natural" ? STATE.naturalStates[v] : null;
+    if (nat) nat.openedAt = now;             // its minimum open time counts from when it really opens
+  }
+}
+
+// Remember how many valves were commanded open at each tick, for a few
+// seconds. A controller's restart is only noticed ~0.5 s after it lost power
+// (when its boot-up message arrives); what matters for sizing the supply is
+// the load at the moment it went quiet.
+function recordLoad(now) {
+  const per = new Array(NUM_CONTROLLERS + 1).fill(0);
+  for (const v of energized) per[ctrlOf(v)]++;
+  loadHistory.push({ t: now, total: energized.size, per });
+  while (loadHistory.length > 50) loadHistory.shift();
+}
+
+// The load when controller n was last heard from, or null if we have no record.
+function loadWhenLastHeard(n) {
+  const t = CTRL[n].lastSeen;
+  let hit = null;
+  for (const h of loadHistory) { if (h.t <= t + 20) hit = h; else break; }
+  return hit && t - hit.t < 500 ? { total: hit.total, here: hit.per[n] } : null;
+}
+
+// Output 1 of every controller first, then output 2 of every controller, …
+function joinOrder(v) { return ((v - 1) % VALVES_PER_CTRL) * NUM_CONTROLLERS + ctrlOf(v); }
+
+// A controller we can expect to obey. Without a CAN link (simulation, or the
+// link dropped mid-run) there is nothing to tell them apart by.
+function ctrlUsable(n) { return !canBus || CTRL[n].status !== "offline"; }
+
 // Advance the natural open/close state machine for each active valve.
 function tickNaturalCloseReopen(now) {
   STATE.active_ids.forEach(id => {
@@ -534,6 +1199,15 @@ function snapshot(extra = {}) {
     valve_flow_limit: STATE.valveFlowLimit,
     can_connected:    !!canBus,
     can_simulated:    canSimulated,
+    can_error:        canBus ? null : canError,
+    can_tx_ok:        canTxOk,
+    mqtt_connected:   !!(mqttClient && mqttClient.connected),
+    mqtt_error:       mqttError,
+    supply_v:         supplyVolts(),
+    start_blocked_ms: Math.max(0, startBlockedUntil - Date.now()),
+    controllers:      CTRL.slice(1).map((c, i) => ({ id: i + 1, status: c.status, boots: c.boots })),
+    offline_controllers: offlineControllers(),
+    stuck_open_ids:   Array.from(stuckOpen).sort((a, b) => a - b),
     ...extra,
   };
 }
@@ -549,7 +1223,24 @@ function syncModeStates() {
 // ============================================================================
 ipcMain.handle("api:state", () => snapshot());
 
-ipcMain.handle("api:start", () => {
+// Begin a run. Returns { status: "started" | "running" | "blocked", message? }.
+// Refusals are deliberate: a run that cannot reach the valves must not look
+// like one that can, and a run that has just been stopped to protect the
+// hardware must not be restarted in the same breath.
+function startRun() {
+  if (STATE.running) return { status: "running" };
+
+  const now = Date.now();
+  if (now < startBlockedUntil) {
+    const wait = Math.ceil((startBlockedUntil - now) / 1000);
+    return { status: "blocked", message: `Start is blocked for ${wait} s: ${startBlockReason}.` };
+  }
+  if (!canBus && !SIMULATE) {
+    const why = canError ? canError.detail : "there is no CAN link to the valve controllers.";
+    console.warn("[SYSTEM] Start refused —", why);
+    return { status: "blocked", message: `Cannot start: ${why}` };
+  }
+
   // "Just works": starting with nothing selected opens every valve. In normal
   // (continuous) mode this means Start releases gas through all 49 valves and
   // keeps flowing until the per-valve cap, Stop, or Emergency Stop.
@@ -558,6 +1249,9 @@ ipcMain.handle("api:start", () => {
     console.log("[SYSTEM] No selection — defaulting to all 49 valves");
   }
   STATE.running = true;
+  energized     = new Set();
+  loadHistory   = [];
+  for (let n = 1; n <= NUM_CONTROLLERS; n++) { CTRL[n].runMinV = null; CTRL[n].lowWarned = false; }
   syncModeStates();
   applyRandomDriver(); // spawn venttiiliohjaus.py if we're starting in random mode
 
@@ -571,23 +1265,36 @@ ipcMain.handle("api:start", () => {
     }, STATE.duration);
   }
 
-  console.log("[SYSTEM] Started — mode:", STATE.mode, "duration:", STATE.duration);
+  console.log(`[SYSTEM] Started — mode: ${STATE.mode} duration: ${STATE.duration} valves: ${STATE.active_ids.length}`);
+  if (mqttError) console.warn(`[SYSTEM] This run is NOT being published: ${mqttError}`);
   pushStateToRenderer();
-  return { status: "started" };
-});
+  return { status: "started", mqtt_warning: mqttError };
+}
+
+ipcMain.handle("api:start", () => startRun());
 
 function doStop() {
+  const wasRunning   = STATE.running;
   STATE.running      = false;
   STATE.valve_states = new Array(VALVE_COUNT + 1).fill(false);
+  energized          = new Set();
   if (autoStopTimer) { clearTimeout(autoStopTimer); autoStopTimer = null; }
   stopPythonRandom(); // running is now false, so its close handler won't respawn
   sendAllClosed();
+  // What is recorded over MQTT must end closed as well (the reference script
+  // did the same); otherwise the last message says the valves are still open.
+  if (wasRunning) {
+    publishState(STATE.valve_states);
+    publishFlow(new Array(VALVE_COUNT + 1).fill(0.0));
+  }
 }
 
 ipcMain.handle("api:stop", () => {
+  const wasRunning = STATE.running;
   doStop();
   pushStateToRenderer();
   console.log("[SYSTEM] Stopped");
+  if (wasRunning) logRunPower("stopped");
   return { status: "stopped" };
 });
 
@@ -599,9 +1306,12 @@ ipcMain.handle("api:emergency", () => {
   STATE.active_ids    = [];
   STATE.valve_states  = new Array(VALVE_COUNT + 1).fill(false);
   STATE.naturalStates = {};
+  energized           = new Set();
   if (autoStopTimer) { clearTimeout(autoStopTimer); autoStopTimer = null; }
   stopPythonRandom(); // kill the random driver before blasting closes
   sendAllClosed(5); // 5 paced close sweeps, mirroring the reference shutdown
+  publishState(STATE.valve_states);
+  publishFlow(new Array(VALVE_COUNT + 1).fill(0.0));
   pushStateToRenderer({ emergency: true });
   console.warn("[SYSTEM] *** EMERGENCY STOP *** all valves forced closed");
   return { status: "EMERGENCY STOP" };
@@ -714,7 +1424,7 @@ function createWindow() {
   mainWindow.on("closed", () => { mainWindow = null; });
 }
 
-app.whenReady().then(() => {
+if (isPrimaryInstance) app.whenReady().then(() => {
   setupMqtt();
   setupCan();
   createWindow();
@@ -726,39 +1436,61 @@ app.whenReady().then(() => {
   if (process.env.MEQAL_AUTOSTART === "1") {
     setTimeout(() => {
       STATE.active_ids = Array.from({ length: VALVE_COUNT }, (_, i) => i + 1);
-      STATE.running    = true;
-      syncModeStates();
-      pushStateToRenderer();
-      console.log("[SYSTEM] AUTOSTART — all valves, continuous");
+      const res = startRun();
+      console.log(res.status === "started"
+        ? "[SYSTEM] AUTOSTART — all valves, continuous"
+        : `[SYSTEM] AUTOSTART refused — ${res.message || res.status}`);
     }, 800);
   }
 
   app.on("activate", () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
   });
+
+  // The desktop icon was clicked while we are already running: show ourselves.
+  app.on("second-instance", () => {
+    if (!mainWindow) return;
+    if (mainWindow.isMinimized()) mainWindow.restore();
+    mainWindow.focus();
+  });
 });
 
+// Runs once, from whichever exit path comes first (window closed, quit).
 function shutdown() {
+  if (shuttingDown) return;
+  shuttingDown  = true;
+  STATE.running = false;
   if (controlLoopTimer)    clearInterval(controlLoopTimer);
   if (canRefreshTimer)     clearInterval(canRefreshTimer);
   if (canTxTimer)          clearInterval(canTxTimer);
+  if (canSuperviseTimer)   clearInterval(canSuperviseTimer);
+  if (canSupplyTimer)      clearInterval(canSupplyTimer);
+  if (canRetryTimer)       clearInterval(canRetryTimer);
+  for (let n = 1; n <= NUM_CONTROLLERS; n++) if (CTRL[n].faultTimer) clearTimeout(CTRL[n].faultTimer);
   if (autoStopTimer)       clearTimeout(autoStopTimer);
   if (connectionHealTimer) clearInterval(connectionHealTimer);
   if (pythonProc) { try { pythonProc.kill("SIGTERM"); } catch (_) {} pythonProc = null; }
   // The paced drain is stopping with us, so send the closing frames directly
   // and synchronously here to guarantee every valve is shut on the way out.
   if (canBus) {
-    for (let r = 0; r < 5; r++) {
-      for (let ctrl = 1; ctrl <= NUM_CONTROLLERS; ctrl++) {
-        for (const f of buildCtrlFrames(ctrl, new Set())) {
-          try { canBus.send({ id: f.id, data: f.data, ext: false, rtr: false }); } catch (_) {}
-        }
-      }
+    if (closeAllValvesBlocking()) {
+      console.log("[SYSTEM] Exit — all valves commanded closed");
+    } else {
+      console.warn("[SYSTEM] Exit — could NOT deliver the close commands (bus not responding). CHECK THE VALVES.");
     }
+  } else if (canLost && canEverUp) {
+    console.warn("[SYSTEM] Exit — the CAN link was down, the valves could not be commanded closed. CHECK THE VALVES.");
   }
   try { if (canBus) canBus.stop(); } catch (_) {}
   try { if (mqttClient) mqttClient.end(true); } catch (_) {}
 }
+
+// Last line of defence: an unexpected error in the main process must not
+// leave valves open with nothing commanding them. Log it, stop, close.
+process.on("uncaughtException", (err) => {
+  console.error("[SYSTEM] Internal error — stopping and closing all valves:", (err && err.stack) || err);
+  try { doStop(); pushStateToRenderer({ notice: "Internal error — system stopped, valves closed", notice_error: true }); } catch (_) {}
+});
 
 app.on("window-all-closed", () => {
   shutdown();

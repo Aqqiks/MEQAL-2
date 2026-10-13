@@ -13,6 +13,7 @@
 
 const GRID_SIZE        = 7;
 const VALVE_COUNT      = 49;
+const VALVES_PER_CTRL  = 10;             // valves per CAN controller (matches main.js)
 
 // --- Local UI state ----------------------------------------------------------
 let activeValves   = new Set();
@@ -30,6 +31,9 @@ const sbStatus    = $("sbStatus");
 const sbTime      = $("sbTime");
 const canStatus   = $("canStatus");
 const canDot      = $("canDot");
+const mqttStatus  = $("mqttStatus");
+const mqttDot     = $("mqttDot");
+const supplyStatus = $("supplyStatus");
 const normalBtn   = $("normalBtn");
 const randomBtn   = $("randomBtn");
 const naturalBtn  = $("randomCapsBtn");
@@ -46,7 +50,8 @@ function toast(msg, isError = false) {
   el.style.borderColor = isError ? "var(--red)" : "var(--border-hi)";
   el.classList.add("show");
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => el.classList.remove("show"), 3000);
+  // Problems stay up long enough to be read.
+  toastTimer = setTimeout(() => el.classList.remove("show"), isError ? 8000 : 3000);
 }
 
 // ============================================================================
@@ -93,9 +98,15 @@ function reflectSelectAll() {
 // Start: opens the selected valves (or all 49 if none are selected) and runs
 // in the current mode until the cap, Stop, or Emergency Stop. Start and Stop
 // are distinct buttons — no fragile double-press gesture.
-$("startBtn").addEventListener("click", async () => {
-  await window.api.start();
-  toast(isRunning ? "Already running" : "System started");
+$("startBtn").addEventListener("click", async (e) => {
+  // Drop keyboard focus so a held or repeating Enter/Space cannot press Start
+  // again and again.
+  if (e && e.currentTarget && e.currentTarget.blur) e.currentTarget.blur();
+  const res = (await window.api.start()) || {};
+  if (res.status === "blocked")      toast(res.message || "Start refused", true);
+  else if (res.status === "running") toast("Already running");
+  else if (res.mqtt_warning)         toast(`Started, but NOT publishing: ${res.mqtt_warning}`, true);
+  else                               toast("System started \u2014 valves open a few at a time");
 });
 
 $("stopBtn").addEventListener("click", async () => {
@@ -375,9 +386,43 @@ function updateUi(state) {
   sysStatus.textContent = isRunning ? "RUNNING" : "IDLE";
   sbStatus.textContent  = isRunning ? `Running \u00B7 ${actCount} valves active` : "System idle";
 
-  const connected       = !!state.can_connected;
-  canDot.className      = "can-dot " + (connected ? "ok" : "err");
-  canStatus.textContent = connected ? "CAN OK" : (state.can_simulated ? "CAN SIM" : "NO CAN");
+  // CAN link + controller health. "CAN OK" only when frames are leaving the
+  // Pi AND every controller is answering — an open socket alone proves nothing.
+  const connected = !!state.can_connected;
+  const txOk      = state.can_tx_ok !== false;
+  const ctrls     = state.controllers || [];
+  const answering = ctrls.filter(c => c.status === "online").length;
+  const offline   = new Set(connected ? (state.offline_controllers || []) : []);
+  const stuck     = new Set(connected ? (state.stuck_open_ids || []) : []);
+  let canText;
+  if (!connected)        canText = state.can_simulated ? "SIMULATION \u2014 no valve moves"
+                                 : (state.can_error && state.can_error.label) || "NO CAN";
+  else if (!txOk)        canText = "CAN TX FAILING";
+  else if (offline.size) canText = `CONTROLLER ${Array.from(offline).join(", ")} NOT RESPONDING`;
+  else                   canText = ctrls.length ? `CAN OK · ${answering}/${ctrls.length} controllers` : "CAN OK";
+  if (stuck.size) canText += ` · VALVE ${Array.from(stuck).join(", ")} STILL OPEN`;
+  const healthy = connected && txOk && !offline.size && !stuck.size && answering === ctrls.length;
+  canDot.className      = "can-dot " + (healthy ? "ok" : "err");
+  canStatus.textContent = canText;
+  canStatus.title       = (!connected && state.can_error && state.can_error.detail) || "";
+
+  // MQTT: is this run being recorded?
+  if (mqttStatus) {
+    const mqttOk = !!state.mqtt_connected;
+    mqttDot.className      = "can-dot " + (mqttOk ? "ok" : "err");
+    mqttStatus.textContent = mqttOk ? "MQTT OK" : "NO MQTT";
+    mqttStatus.title       = mqttOk ? "" : (state.mqtt_error || "");
+  }
+
+  // Lowest supply voltage the controllers currently measure.
+  if (supplyStatus) {
+    const volts = (state.supply_v || []).filter(v => typeof v === "number");
+    supplyStatus.textContent = volts.length ? `${Math.min(...volts).toFixed(1)} V` : "\u2013 V";
+    supplyStatus.title = volts.length
+      ? "Supply per controller: " + (state.supply_v || []).map((v, i) => `${i + 1}: ${typeof v === "number" ? v.toFixed(1) + " V" : "\u2013"}`).join("   ")
+      : "";
+    supplyStatus.style.color = volts.length && Math.min(...volts) < 10.5 ? "var(--red)" : "";
+  }
 
   if (state.mode) { currentMode = state.mode; reflectMode(); }
 
@@ -391,9 +436,19 @@ function updateUi(state) {
     const isSelected = activeValves.has(i);
     const isOpen     = state.valve_states ? !!state.valve_states[i] : false;
     const isLimited  = limited.has(i);
+    // A valve whose controller is not answering is not under our control,
+    // whatever we commanded — never draw it as simply "open".
+    const ctrl       = Math.floor((i - 1) / VALVES_PER_CTRL) + 1;
+    const noLink     = connected && (!txOk || offline.has(ctrl));
+    const isStuck    = stuck.has(i);
     box.classList.toggle("online", isSelected || isOpen);
     box.classList.toggle("done", isLimited && !isSelected && !isOpen);
+    box.classList.toggle("nolink", noLink);
+    box.classList.toggle("stuck", isStuck);
     box.classList.remove("offline");
+    box.title = isStuck ? `Valve ${i}: still driven although commanded closed`
+              : noLink  ? `Valve ${i}: controller ${ctrl} is not responding`
+              : "";
   }
   reflectSelectAll();
 
@@ -428,6 +483,8 @@ function updateUi(state) {
 window.api.onStateUpdate((state) => {
   updateUi(state);
   if (state.auto_stopped) toast("Timer elapsed — system stopped");
+  // Controller / CAN events from the main process (restart, lost, fault…).
+  if (state.notice) toast(state.notice, !!state.notice_error);
 });
 
 async function loadInitialState() {
@@ -439,6 +496,9 @@ async function loadInitialState() {
   }
   if (state.mode) { currentMode = state.mode; reflectMode(); }
   updateUi(state);
+  // Missing hardware or libraries are said out loud once at start-up.
+  if (!state.can_connected && !state.can_simulated && state.can_error) toast(state.can_error.detail, true);
+  else if (state.mqtt_error) toast(`Not publishing: ${state.mqtt_error}`, true);
 }
 
 // Charts last; if they throw, the controls above are already live.
